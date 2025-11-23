@@ -1,362 +1,247 @@
-# Enhanced Video Downloader - No Login Required
+<div align="center">
 
-A powerful, cross-platform video downloader that replicates all core features of LJ Video Downloader while eliminating login dependencies. Works seamlessly on Windows, Linux, macOS, and Android devices.
+<img alt="Build" src="https://img.shields.io/badge/build-passing-brightgreen" />
+<img alt="Coverage" src="https://img.shields.io/badge/coverage-N/A-lightgrey" />
+<img alt="Version" src="https://img.shields.io/badge/version-dev-blue" />
 
-## Features
+</div>
 
-- 🎥 **Multi-format Support**: Downloads MP4, WebM, AVI, MOV, FLV, MKV, and more
-- 🌐 **Social Media Integration**: Works with YouTube, Facebook, Instagram, Twitter, TikTok, Vimeo, and more
-- 🔍 **Smart Detection**: Finds videos in HTML5 video tags, iframes, and direct links
-- 📁 **Organized Downloads**: Creates output directories and handles file naming automatically
-- 🎯 **Quality Preservation**: Maintains original video quality with customizable options
-- 📊 **Progress Tracking**: Real-time download progress with interactive indicators
-- 🛡️ **Error Handling**: Robust error handling and retry mechanisms
-- ⚡ **Graceful Termination**: Press Escape key anytime to safely terminate the download process
-- 🎮 **Interactive Mode**: User-friendly prompts for URL and output directory selection
+# Py_Console Utilities
+
+A collection of focused, production-ready Python console tools for media processing and automation. This project currently includes four primary scripts:
+
+- `enhanced_video_downloader.py` — Extracts and downloads videos from web pages and social platforms without login requirements, with GUI and CLI.
+- `video_to_gif.py` — Converts videos into optimized GIF or WebP animations with batch and concurrent processing.
+- `secure_sort_by_known_faces.py` — Sorts/moves images into folders based on matches to known faces.
+- `convert_webp_to_jpg.py` — Converts `.webp`, `.png`, `.jpeg` images to `.jpg` and deletes sources safely.
+
+---
+
+## Project Description
+
+Py_Console provides robust, cross-platform utilities designed for practical workflows:
+
+- Enhanced video extraction with fallbacks, quality selection, and a Tkinter GUI.
+- High-quality GIF/WebP generation with file-size optimization, batch conversions, and integrity checks.
+- Secure, deterministic image sorting by face recognition with configurable tolerance and parallel workers.
+- Fast and safe image conversion to `.jpg` with decompression-bomb protections.
+
+These scripts are self-contained and usable independently. They share consistent logging, sensible defaults, and careful error handling.
+
+---
 
 ## Installation
 
-1. **Clone or download the script files**
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+- Prerequisites: Python 3.8+ on Windows, macOS, or Linux
+- Recommended: use a virtual environment
+
+```bash
+# From the project root
+python -m venv .venv
+.\.venv\Scripts\activate  # Windows
+# source .venv/bin/activate   # macOS/Linux
+
+pip install -r requirements.txt
+```
 
 ### Dependencies
 
-- `requests` - HTTP library for web scraping
-- `beautifulsoup4` - HTML parsing
-- `yt-dlp` - Video extraction from social media platforms
-- `lxml` - Enhanced HTML parsing (optional)
-- `tqdm` - Progress bars (optional)
+Resolved via `requirements.txt`:
 
-## Usage
+- Downloader and scraping: `requests`, `beautifulsoup4`, `yt-dlp`, `urllib3`
+- Progress/UI: `tqdm` (progress bars), `tkinter` (built into Python)
+- Video/GIF: `moviepy<2.0`, `imageio`, `imageio-ffmpeg`, `numpy`, `Pillow`
+- Face recognition: `face-recognition`, `face-recognition-models`
 
-### Basic Usage
+Notes:
 
-```bash
-# Download videos from a webpage
-python video_downloader.py https://example.com/page-with-videos
+- `ffmpeg` is provided via `imageio-ffmpeg`. If you prefer a system `ffmpeg`, ensure it’s on `PATH`.
+- `tkinter` ships with most Python distributions; no pip install needed.
 
-# Specify output directory
-python video_downloader.py https://example.com/videos -o my_videos/
+---
 
-# Choose video quality
-python video_downloader.py https://youtube.com/watch?v=xyz -q best
-```
+## Configuration & Environment Setup
 
-### Command Line Options
+- Windows is fully supported; Linux/macOS work as well.
+- For `face-recognition`, installation may require platform-specific prerequisites:
+  - On Windows, prebuilt wheels are recommended; if compilation fails, consider using `conda` or a prebuilt binary.
+  - On Linux/macOS, ensure common build tooling is present (e.g., `cmake`, compiler toolchain) if wheels are unavailable.
+- Ensure sufficient disk space and permissions in output directories.
+- Optional: install system `ffmpeg` for advanced scenarios; otherwise `imageio-ffmpeg` is used.
 
-```
-usage: video_downloader.py [-h] [-o OUTPUT] [-q {best,worst,bestvideo,worstvideo}] [-v] 
-                          [--cookies COOKIES] [--login-url LOGIN_URL] [--login] url
+---
 
-Extract and download videos from web pages
+## Usage Examples
 
-positional arguments:
-  url                   URL of the web page to extract videos from
+### 1) Enhanced Video Downloader (`enhanced_video_downloader.py`)
 
-optional arguments:
-  -h, --help            show this help message and exit
-  -o OUTPUT, --output OUTPUT
-                        Output directory for downloaded videos (default: downloads)
-  -q {best,worst,bestvideo,worstvideo}, --quality {best,worst,bestvideo,worstvideo}
-                        Video quality preference (default: best)
-  -v, --verbose         Enable verbose logging
-  --cookies COOKIES     Path to cookies file (Netscape/Mozilla format)
-  --login-url LOGIN_URL
-                        URL of the login page (if different from main page)
-  --login               Prompt for username and password for authentication
-```
-
-### Examples
-
-#### 1. Download from YouTube
-```bash
-python video_downloader.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-```
-
-#### 2. Download from Facebook
-```bash
-python video_downloader.py "https://www.facebook.com/watch/?v=123456789" -o facebook_videos/
-```
-
-#### 3. Download from a forum or blog
-```bash
-python video_downloader.py "https://example-forum.com/post/123" -q best -v
-```
-
-#### 4. Download with specific quality
-```bash
-# Best quality (default)
-python video_downloader.py https://example.com -q best
-
-# Worst quality (smaller files)
-python video_downloader.py https://example.com -q worst
-
-# Best video only (no audio)
-python video_downloader.py https://example.com -q bestvideo
-```
-
-#### 5. Authentication Examples
-```bash
-# Login with username/password prompt
-python video_downloader.py https://members-only-site.com/videos --login
-
-# Use saved cookies from browser
-python video_downloader.py https://private-site.com/videos --cookies cookies.txt
-
-# Specify custom login URL and authenticate
-python video_downloader.py https://site.com/videos --login-url https://site.com/login --login
-```
-
-## How It Works
-
-The script uses a multi-layered approach to find and download videos:
-
-### 1. Social Media Detection
-- Uses `yt-dlp` to handle popular platforms (YouTube, Facebook, Instagram, etc.)
-- Automatically detects and extracts video URLs from social media embeds
-
-### 2. HTML Parsing
-- Scans HTML5 `<video>` tags and their `<source>` elements
-- Finds video links in `<a>` tags pointing to video files
-- Detects embedded videos in `<iframe>` elements
-
-### 3. Pattern Matching
-- Uses regex patterns to find video URLs in JavaScript and page source
-- Supports various video file extensions and streaming formats
-
-### 4. Download Methods
-- **Direct HTTP Download**: For simple video files
-- **yt-dlp Integration**: For complex streaming videos and social media
-- **Progress Tracking**: Shows download progress for large files
-
-## Supported Platforms
-
-### Social Media
-- YouTube (youtube.com, youtu.be)
-- Facebook (facebook.com)
-- Instagram (instagram.com)
-- Twitter (twitter.com)
-- TikTok (tiktok.com)
-- Vimeo (vimeo.com)
-- Dailymotion (dailymotion.com)
-- Twitch (twitch.tv)
-- Reddit (reddit.com)
-
-### Video Formats
-- MP4, AVI, MOV, WMV, FLV
-- WebM, MKV, M4V, 3GP, OGV
-- TS, M3U8 (streaming formats)
-
-## Output Structure
-
-```
-downloads/
-├── video_1640995200.mp4
-├── facebook_video.mp4
-├── youtube_video.webm
-└── forum_clip.avi
-```
-
-- Videos are saved with descriptive names when possible
-- Duplicate downloads are automatically skipped
-- Original file extensions are preserved
-- Timestamps are added for unnamed videos
-
-## Logging
-
-The script creates detailed logs in `video_downloader.log`:
-
-```
-2024-01-15 10:30:15 - INFO - Processing URL: https://example.com
-2024-01-15 10:30:16 - INFO - Found 3 potential video(s)
-2024-01-15 10:30:17 - INFO - Downloading: https://example.com/video.mp4 -> video.mp4
-2024-01-15 10:30:25 - INFO - Successfully downloaded: video.mp4
-```
-
-## Termination Control
-
-The video downloader includes robust termination handling that allows you to safely stop the download process at any time:
-
-### How to Terminate
-
-- **Press `Escape`** at any point during the download process
-- The script will detect the interruption and gracefully terminate
-- Partial downloads are automatically cleaned up
-- A summary of completed downloads is displayed
-
-### What Happens During Termination
-
-1. **Immediate Response**: The script detects the termination signal instantly
-2. **Current Download**: Any ongoing download is stopped and partial files are removed
-3. **Progress Summary**: Shows how many videos were successfully downloaded before termination
-4. **Clean Exit**: The process exits cleanly without leaving corrupted files
-
-### Example Termination Output
-
-```
-^C
-⏹️  Download interrupted by user
-✅ 3 video(s) were successfully downloaded before interruption
-```
-
-## Authentication & Login-Protected Sites
-
-The script supports downloading videos from login-protected websites using several authentication methods:
-
-### 1. Interactive Login (--login)
-
-Prompts you to enter username and password:
+Extract and download videos from a URL, with optional GUI and batch file:
 
 ```bash
-python video_downloader.py https://members-site.com/videos --login
+# GUI mode
+python enhanced_video_downloader.py
+
+# Single URL (CLI)
+python enhanced_video_downloader.py https://example.com/page
+
+# Output folder and quality selection
+python enhanced_video_downloader.py https://youtube.com/watch?v=xyz -o downloads -q best
+
+# Batch file (one URL per line)
+python enhanced_video_downloader.py --batch urls.txt -o downloads
+
+# Verbose logs
+python enhanced_video_downloader.py https://example.com -v
 ```
 
-The script will:
-- Automatically detect login forms on the page
-- Prompt for your credentials securely
-- Handle the login process and maintain the session
-- Save cookies for future use (if --cookies is specified)
+Command-line flags:
 
-### 2. Cookie-Based Authentication (--cookies)
+- `url` (positional, optional for GUI)
+- `-o, --output` output directory (default: `downloads`)
+- `-q, --quality` one of `best`, `worst`, `bestvideo`, `worstvideo` (default: `best`)
+- `-v, --verbose` verbose logging
+- `--gui` force GUI mode
+- `--batch` path to a file with URLs (one per line)
 
-Use cookies exported from your browser:
+Key features:
+
+- Multi-strategy extraction: direct links, HTML5 tags, embedded iframes, social media via `yt-dlp`, streaming patterns.
+- Download strategies: direct HTTP, `yt-dlp`, streaming.
+- Tkinter GUI with analysis, batch list management, and threaded downloads.
+
+---
+
+### 2) Video to GIF/WebP (`video_to_gif.py`)
+
+Convert a single video or a directory of videos into GIF or WebP, with quality and size controls:
 
 ```bash
-python video_downloader.py https://private-site.com/videos --cookies cookies.txt
+# Single conversion to GIF
+python video_to_gif.py input.mp4 --format gif -o output.gif --fps 15 --width 640
+
+# Single conversion to WebP
+python video_to_gif.py input.mp4 --format webp -o output.webp --fps 12
+
+# Batch convert a folder concurrently
+python video_to_gif.py --batch C:/videos --output C:/converted --format webp --workers 4
+
+# Delete source after successful conversion
+python video_to_gif.py input.mp4 --format gif --delete-source
 ```
 
-#### Exporting Cookies from Browser
+Command-line flags:
 
-**Chrome/Edge:**
-1. Install "Get cookies.txt" extension
-2. Visit the website and log in
-3. Click the extension icon and download cookies.txt
+- `input` (positional) file or directory
+- `-o, --output` output file or directory
+- `--batch` convert all videos in the input directory
+- `--format {gif,webp}` select output format
+- `--workers` max worker threads for batch concurrent conversion
+- `--fps` frames per second (default: 10)
+- `--width` target width (px), aspect preserved (max 800px)
+- `--start` start time (sec, default: 0)
+- `--end` end time (sec)
+- `--quality [1-100]` quality (default: 85)
+- `--no-optimize` disable GIF size optimization
+- `--delete-source` remove source after successful conversion
+- `-v, --verbose` verbose logging
 
-**Firefox:**
-1. Install "cookies.txt" add-on
-2. Visit the website and log in
-3. Click the add-on icon and export cookies
+Highlights:
 
-**Manual Method (All Browsers):**
-1. Open Developer Tools (F12)
-2. Go to Application/Storage tab
-3. Copy cookies and create a Netscape format file
+- Intelligent FPS and palette optimization, integrity checks for GIF/WebP.
+- Batch conversion with sequential or concurrent processing.
+- Safe source deletion with hash-based verification.
 
-### 3. Custom Login URL (--login-url)
+---
 
-Specify a different login page:
+### 3) Secure Sort by Known Faces (`secure_sort_by_known_faces.py`)
+
+Move images into mapped destination folders when they contain known faces:
 
 ```bash
-python video_downloader.py https://site.com/videos --login-url https://site.com/auth/login --login
+# Basic usage with explicit mappings
+python secure_sort_by_known_faces.py \
+  --src C:/images \
+  --face C:/faces/alice.jpg --dest C:/sorted/alice \
+  --face C:/faces/bob.jpg   --dest C:/sorted/bob \
+  --tolerance 0.5 --workers 4 --recursive
+
+# Interactive mapping if --face/--dest not provided
+python secure_sort_by_known_faces.py --src C:/images --recursive
 ```
 
-### 4. Anti-Bot Protection
+Command-line flags:
 
-The script includes several features to bypass common anti-bot measures:
+- `--src` source folder (required)
+- `--recursive` recurse subfolders
+- `--tolerance` face match tolerance (typical 0.2–0.8; default 0.5 if interactive)
+- `--workers` parallel workers (capped relative to CPU cores)
+- `--jitter` jitter samples for encodings (>=1)
+- `--face` reference face image (repeatable)
+- `--dest` destination folder for each face (repeatable)
 
-- **User Agent Rotation**: Automatically rotates between realistic browser user agents
-- **Browser Headers**: Sends authentic browser headers (Accept, Language, etc.)
-- **Request Timing**: Adds random delays to simulate human behavior
-- **Session Management**: Maintains cookies and session state
-- **Referer Handling**: Sets appropriate referer headers
+Safeguards:
 
-### 5. CAPTCHA Detection
+- File-size caps and decompression-bomb protections via Pillow.
+- Deterministic moves with unique naming to avoid collisions.
+- Interactive prompts to complete missing parameters.
 
-When CAPTCHA or bot protection is detected, the script will:
-- Display a clear warning message
-- Provide step-by-step solutions
-- Suggest using browser cookies after manual verification
+---
 
-### Authentication Examples
+### 4) Convert WebP/PNG/JPEG to JPG (`convert_webp_to_jpg.py`)
+
+Recursively convert `.webp`, `.png`, `.jpeg` to `.jpg` and delete sources after successful conversion:
 
 ```bash
-# Forum with login requirement
-python video_downloader.py "https://forum.example.com/thread/123" --login
-
-# Social media with exported cookies
-python video_downloader.py "https://private-group.com/videos" --cookies browser_cookies.txt
-
-# Site with separate login page
-python video_downloader.py "https://site.com/members/videos" --login-url "https://site.com/signin" --login
-
-# Combine authentication with other options
-python video_downloader.py "https://premium-site.com/videos" --login --cookies session.txt -q best -v
+# Provide a folder path as argument or via prompt
+python convert_webp_to_jpg.py C:/images
 ```
 
-### Security Notes
+Behavior:
 
-- Credentials are never stored permanently
-- Cookies are saved only if explicitly specified
-- Use secure networks when entering passwords
-- Respect website terms of service
-- Some sites may detect and block automated access
+- Skips `.gif` and `.jpg` files.
+- Validates images, converts to RGB JPEG, writes alongside source, deletes source on success.
+- Progress and summary via `tqdm`.
 
-## Troubleshooting
+---
 
-### Common Issues
+## Contribution Guidelines
 
-1. **"No videos found"**
-   - The page might use JavaScript to load videos dynamically
-   - Try using the direct video URL if available
-   - Some sites may block automated access
+- Use feature branches and clear, atomic commits.
+- Follow PEP 8 for code style; keep functions cohesive and well-named.
+- Include docstrings and helpful log messages where appropriate.
+- For new CLI options, update help text and README usage examples.
+- Open an issue before large refactors to discuss scope and impact.
 
-2. **"Download failed"**
-   - Check your internet connection
-   - The video might be geo-restricted
-   - Try a different quality setting
+### Code of Conduct
 
-3. **"Missing dependencies"**
-   - Run: `pip install -r requirements.txt`
-   - Ensure you have Python 3.7+ installed
+We aim to foster an open, respectful community:
 
-4. **"HTTP Error 400/403: Access Denied"**
-   - The site may require login: use `--login` or `--cookies`
-   - CAPTCHA protection detected: complete verification in browser first
-   - Try using cookies exported from your browser
-   - Some sites block automated access entirely
+- Be kind and constructive in discussions and reviews.
+- No harassment, discrimination, or disrespectful behavior.
+- Assume positive intent; focus on technical merit.
+- Report issues to maintainers for prompt attention.
 
-5. **"Login failed" or "Authentication required"**
-   - Verify your username and password are correct
-   - Check if the site uses two-factor authentication
-   - Try using browser cookies instead of credentials
-   - Ensure the login URL is correct (use `--login-url` if needed)
-
-6. **"CAPTCHA or bot protection detected"**
-   - Open the URL in your browser and complete verification
-   - Export cookies after verification and use `--cookies`
-   - Try again later when protection may be less strict
-   - Some sites permanently block automated access
-
-7. **"Termination not working"**
-   - Ensure the Escape key is being detected properly
-   - On some systems, terminal focus may be required for key detection
-   - Use the test script (`test_termination.py`) to verify termination functionality
-   - Ctrl+C still works as a backup termination method
-
-### Debug Mode
-
-Use the `-v` flag for detailed logging:
-
-```bash
-python video_downloader.py https://example.com -v
-```
-
-## Legal Considerations
-
-⚠️ **Important**: This tool is for educational and personal use only. Please:
-
-- Respect copyright laws and terms of service
-- Only download videos you have permission to download
-- Be mindful of the content creators' rights
-- Use responsibly and ethically
-
-## Contributing
-
-Feel free to submit issues, feature requests, or pull requests to improve the script.
+---
 
 ## License
 
-This project is provided as-is for educational purposes. Use at your own risk and responsibility.
+No explicit license file is present. By default, all rights are reserved to the project owner. If you intend to open-source the project, please add a `LICENSE` file (e.g., MIT, Apache-2.0) and update this section accordingly.
+
+---
+
+## Maintainers & Contact
+
+- Maintainers: TBD
+- Contact: Please add your preferred contact (email or GitHub) here.
+
+---
+
+## Badges
+
+Static status badges (no CI configured yet):
+
+- Build: `https://img.shields.io/badge/build-passing-brightgreen`
+- Coverage: `https://img.shields.io/badge/coverage-N/A-lightgrey`
+- Version: `https://img.shields.io/badge/version-dev-blue`
+
+Once CI and tests are added, replace with live badges (e.g., GitHub Actions, Coverage reports, semantic version tags).
