@@ -69,8 +69,42 @@ def is_supported_image(path: str) -> bool:
     return t in ('webp', 'png', 'jpeg')
 
 def target_jpg_path(src_path: str) -> str:
+    """Return the default JPG path (no conflict handling).
+
+    This preserves the original base name and directory, changing only the
+    extension to `.jpg`. Backward-compatible helper retained for internal use.
+    """
     root, _ = os.path.splitext(src_path)
     return root + ".jpg"
+
+def generate_conflict_free_jpg_path(src_path: str) -> str:
+    """Generate a conflict-free `.jpg` path in the same directory.
+
+    Behavior:
+    - If `<basename>.jpg` does not exist, use it as-is.
+    - If it exists, append an incremental number before the extension:
+      `<basename>(1).jpg`, `<basename>(2).jpg`, ... until an available name
+      is found.
+
+    This maintains the original base name and directory, and applies uniformly
+    to WEBP/PNG/JPEG sources. Only the output filename changes when necessary.
+    """
+    # Derive directory and base name
+    dir_name = os.path.dirname(src_path)
+    base_name = os.path.splitext(os.path.basename(src_path))[0]
+
+    # First try the natural target
+    candidate = os.path.join(dir_name, f"{base_name}.jpg")
+    if not os.path.exists(candidate):
+        return candidate
+
+    # Incrementally try numbered variants
+    n = 1
+    while True:
+        candidate = os.path.join(dir_name, f"{base_name}({n}).jpg")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
 
 def _webp_has_animation_vp8x(head: bytes) -> Optional[bool]:
     # Minimal parsing to inspect VP8X feature bits and ANIM chunk presence
@@ -147,7 +181,8 @@ def convert_one(file_path: str) -> Tuple[bool, str]:
             # Preserve orientation
             im2 = ImageOps.exif_transpose(im2)
             rgb = im2.convert("RGB")
-            out_path = target_jpg_path(file_path)
+            # Determine a conflict-free output path in the same directory
+            out_path = generate_conflict_free_jpg_path(file_path)
             if os.path.abspath(out_path) == os.path.abspath(file_path):
                 return (False, "same path as source")
 
