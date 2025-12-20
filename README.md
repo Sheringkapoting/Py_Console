@@ -273,11 +273,12 @@ Purpose
 
 - Recursively convert `.webp`, `.png`, `.jpeg` images to `.jpg` with high-quality settings, while safely skipping unsupported or animated WebP files. Preserves EXIF orientation and metadata when present.
 
-Supported formats and behavior
-
-- Converts: `.webp` (non-animated), `.png`, `.jpeg`
-- Skips: `.gif`, videos (`.mp4`, `.mov`, `.avi`, `.mkv`), and animated WebP
-- Validates images and applies decompression-bomb protections; writes output alongside source file as `same_name.jpg`
+276→Supported formats and behavior
+277→
+278→- Converts: `.webp` (non-animated), `.png`, `.jpeg`
+279→- Skips: `.gif`, videos (`.mp4`, `.mov`, `.avi`, `.mkv`), and animated WebP
+280→- Animated WebP detection: inspects RIFF `WEBP` header and chunks, flags animation via `VP8X` animation bit or presence of `ANIM` chunk; such files are rejected from processing
+281→- Validates images and applies decompression-bomb protections; writes output alongside source file as `same_name.jpg`
 
 Parameters
 
