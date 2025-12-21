@@ -8,10 +8,11 @@
 
 # Py_Console Utilities
 
-A collection of focused, production-ready Python console tools for media processing and automation. This project currently includes four primary scripts:
+A collection of focused, production-ready Python console tools for media processing and automation. This project currently includes five primary scripts:
 
 - `enhanced_video_downloader.py` — Extracts and downloads videos from web pages and social platforms without login requirements, with GUI and CLI.
 - `video_to_gif.py` — Converts videos into optimized GIF or WebP animations with batch and concurrent processing.
+- `video_segmenter.py` — Segments videos into short clips (15 seconds by default) with configurable intervals and parallel processing.
 - `secure_sort_by_known_faces.py` — Sorts/moves images into folders based on matches to known faces.
 - `convert_webp_to_jpg.py` — Converts `.webp`, `.png`, `.jpeg` images to `.jpg` and deletes sources safely.
 
@@ -23,6 +24,7 @@ Py_Console provides robust, cross-platform utilities designed for practical work
 
 - Enhanced video extraction with fallbacks, quality selection, and a Tkinter GUI.
 - High-quality GIF/WebP generation with file-size optimization, batch conversions, and integrity checks.
+- Fast video segmentation via stream copying for creating short clips without re-encoding.
 - Secure, deterministic image sorting by face recognition with configurable tolerance and parallel workers.
 - Fast and safe image conversion to `.jpg` with decompression-bomb protections.
 
@@ -204,7 +206,84 @@ Version Compatibility
 
 ---
 
-### 3) Secure Sort by Known Faces (`secure_sort_by_known_faces.py`)
+### 3) Video Segmenter (`video_segmenter.py`)
+
+Purpose
+
+- Segment videos into short clips of fixed duration (15 seconds by default) with configurable time intervals between segment starts. Uses FFmpeg stream copying for fast, lossless segmentation without re-encoding.
+
+Functionality
+
+- Analyzes video duration and computes non-overlapping segment time ranges.
+- Parallel processing with configurable worker threads.
+- Stream copy (`-c copy`) for fast segmentation without quality loss.
+- Automatic retry with exponential backoff for failed segments.
+- Press ESC to gracefully terminate segmentation.
+
+Parameters
+
+| Parameter | Type | Default | Required | Description |
+|---|---|---:|:---:|---|
+| `input_file` (positional) | `Path` | none | Yes | Input video file to segment. |
+| `--segment-duration` | `float` | `15.0` | No | Duration of each segment in seconds. |
+| `--segment-gap` | `float` | `45.0` | No | Time interval before the next segment starts (in seconds). |
+| `--output-dir` | `Path` | none | No | Output directory for segments. Defaults to input file name (as a folder). |
+| `--workers` | `int` | `4` | No | Number of parallel segmentation workers. |
+| `--retries` | `int` | `2` | No | Maximum retry attempts per failed segment. |
+
+Segmentation Logic
+
+For a 120-second video with `--segment-duration 15` and `--segment-gap 45`:
+- **Segment 001**: 0–15s
+- **Segment 002**: 45–60s
+- **Segment 003**: 90–105s
+
+Output Files
+
+Segments are saved as MP4 files in the output directory with naming format:
+```
+{input_name}_segment_001.mp4
+{input_name}_segment_002.mp4
+{input_name}_segment_003.mp4
+...
+```
+
+Examples
+
+```bash
+# Basic segmentation with defaults (15s segments, 45s gap)
+python video_segmenter.py input.mp4
+
+# Custom segment duration (10 seconds each, repeat every 40 seconds)
+python video_segmenter.py input.mp4 --segment-duration 10 --segment-gap 40
+
+# With custom output directory
+python video_segmenter.py input.mp4 --output-dir ./segments
+
+# Using multiple workers for faster parallel segmentation
+python video_segmenter.py input.mp4 --workers 8 --retries 3
+```
+
+Dependencies / Prerequisites
+
+- `imageio-ffmpeg` (provides FFmpeg)
+- `tqdm` (progress bar)
+- Optional: system `ffmpeg` on PATH (alternative to `imageio-ffmpeg`)
+
+Troubleshooting
+
+- "Error importing dependencies" → Install: `pip install imageio-ffmpeg tqdm`
+- Segmentation fails on some files → Try `--retries 5` for automatic recovery; check video file integrity.
+- ESC key not working → Ensure running in a terminal that supports Windows API (standard Windows terminals work).
+- Output files incomplete → Check disk space and write permissions in output directory.
+
+Version Compatibility
+
+- Python 3.8+; tested with `imageio-ffmpeg` 0.4.x, `tqdm` 4.x
+
+---
+
+### 4) Secure Sort by Known Faces (`secure_sort_by_known_faces.py`)
 
 Purpose
 
@@ -267,7 +346,7 @@ Version Compatibility
 
 ---
 
-### 4) Convert WebP/PNG/JPEG to JPG (`convert_webp_to_jpg.py`)
+### 5) Convert WebP/PNG/JPEG to JPG (`convert_webp_to_jpg.py`)
 
 Purpose
 

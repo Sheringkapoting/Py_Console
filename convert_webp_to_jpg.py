@@ -49,6 +49,8 @@ def is_webp_animated(path: str) -> Tuple[bool, str]:
     except Exception as e:
         return (False, str(e))
 
+
+
 def list_files_recursive(folder: str) -> List[str]:
     files: List[str] = []
     for root, _, fnames in os.walk(folder, topdown=True):
@@ -96,6 +98,9 @@ def convert_one(file_path: str) -> Tuple[bool, str]:
                 return (False, f"invalid image: {e}")
         # Re-open to actually convert after verify() (Pillow requirement)
         with Image.open(file_path) as im2:
+            exif = im2.info.get("exif")
+            icc = im2.info.get("icc_profile")
+
             if im2.mode in ("RGBA", "LA") or (im2.mode == "P" and "transparency" in im2.info):
                 rgba = im2.convert("RGBA")
                 bg = Image.new("RGB", rgba.size, (255, 255, 255))
@@ -108,7 +113,19 @@ def convert_one(file_path: str) -> Tuple[bool, str]:
             if os.path.abspath(out_path) == os.path.abspath(file_path):
                 # Shouldn’t happen because we skip .jpg inputs
                 return (False, "same path as source")
-            rgb.save(out_path, "JPEG")
+
+            save_kwargs = {
+                "quality": 85,
+                "optimize": True,
+                "progressive": True,
+                "subsampling": 2,
+            }
+            if exif:
+                save_kwargs["exif"] = exif
+            if icc:
+                save_kwargs["icc_profile"] = icc
+
+            rgb.save(out_path, "JPEG", **save_kwargs)
         return (True, "")
     except Exception as e:
         return (False, str(e))
@@ -178,16 +195,19 @@ def compress_one_jpg(file_path: str) -> Tuple[bool, str, bool]:
             exif = im.info.get("exif")
             icc = im.info.get("icc_profile")
             rgb = im.convert("RGB")
-            rgb.save(
-                tmp_path,
-                "JPEG",
-                quality=85,
-                optimize=True,
-                progressive=True,
-                subsampling=1,
-                exif=exif,
-                icc_profile=icc,
-            )
+
+            save_kwargs = {
+                "quality": 85,
+                "optimize": True,
+                "progressive": True,
+                "subsampling": 2,
+            }
+            if exif:
+                save_kwargs["exif"] = exif
+            if icc:
+                save_kwargs["icc_profile"] = icc
+
+            rgb.save(tmp_path, "JPEG", **save_kwargs)
         new_size = os.path.getsize(tmp_path)
         if new_size < orig_size:
             os.replace(tmp_path, file_path)
@@ -272,34 +292,4 @@ if __name__ == "__main__":
         compress_jpgs(folder_path)
     else:
         print("[INFO] Compression skipped.")
-def is_webp_animated(path: str) -> Tuple[bool, str]:
-    try:
-        with open(path, 'rb') as f:
-            header = f.read(12)
-            if len(header) < 12:
-                return (False, "truncated header")
-            if header[0:4] != b'RIFF' or header[8:12] != b'WEBP':
-                return (False, "not webp riff")
-            while True:
-                chunk_hdr = f.read(8)
-                if len(chunk_hdr) < 8:
-                    break
-                fourcc = chunk_hdr[0:4]
-                size = int.from_bytes(chunk_hdr[4:8], 'little')
-                if fourcc == b'VP8X':
-                    data = f.read(size)
-                    if len(data) < size:
-                        return (False, "truncated vp8x")
-                    flags = data[0]
-                    if flags & 0x02:
-                        return (True, "vp8x animated")
-                elif fourcc == b'ANIM':
-                    f.seek(size, os.SEEK_CUR)
-                    return (True, "anim chunk")
-                else:
-                    f.seek(size, os.SEEK_CUR)
-                if size % 2 == 1:
-                    f.seek(1, os.SEEK_CUR)
-        return (False, "")
-    except Exception as e:
-        return (False, str(e))
+
