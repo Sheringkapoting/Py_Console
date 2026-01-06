@@ -8,13 +8,14 @@
 
 # Py_Console Utilities
 
-A collection of focused, production-ready Python console tools for media processing and automation. This project currently includes five primary scripts:
+A collection of focused, production-ready Python console tools for media processing and automation. This project currently includes six primary scripts:
 
 - `enhanced_video_downloader.py` — Extracts and downloads videos from web pages and social platforms without login requirements, with GUI and CLI.
 - `video_to_gif.py` — Converts videos into optimized GIF or WebP animations with batch and concurrent processing.
 - `video_segmenter.py` — Segments videos into short clips (15 seconds by default) with configurable intervals and parallel processing.
 - `secure_sort_by_known_faces.py` — Sorts/moves images into folders based on matches to known faces.
 - `convert_webp_to_jpg.py` — Converts `.webp`, `.png`, `.jpeg` images to `.jpg` and deletes sources safely.
+- `compress_videos.py` — Batch compresses videos using H.264/H.265 with CRF quality control and preset selection.
 
 ---
 
@@ -27,6 +28,7 @@ Py_Console provides robust, cross-platform utilities designed for practical work
 - Fast video segmentation via stream copying for creating short clips without re-encoding.
 - Secure, deterministic image sorting by face recognition with configurable tolerance and parallel workers.
 - Fast and safe image conversion to `.jpg` with decompression-bomb protections.
+- Efficient batch video compression with configurable codecs, quality, and presets.
 
 These scripts are self-contained and usable independently. They share consistent logging, sensible defaults, and careful error handling.
 
@@ -57,7 +59,8 @@ Resolved via `requirements.txt`:
 
 Notes:
 
-- `ffmpeg` is provided via `imageio-ffmpeg`. If you prefer a system `ffmpeg`, ensure it’s on `PATH`.
+- `ffmpeg` is provided via `imageio-ffmpeg` for `video_to_gif.py` and `video_segmenter.py`.
+- **System `ffmpeg`** is **required** for `compress_videos.py` and recommended for advanced usage of other scripts. Ensure it’s on your `PATH`.
 - `tkinter` ships with most Python distributions; no pip install needed.
 
 ---
@@ -69,7 +72,7 @@ Notes:
   - On Windows, prebuilt wheels are recommended; if compilation fails, consider using `conda` or a prebuilt binary.
   - On Linux/macOS, ensure common build tooling is present (e.g., `cmake`, compiler toolchain) if wheels are unavailable.
 - Ensure sufficient disk space and permissions in output directories.
-- Optional: install system `ffmpeg` for advanced scenarios; otherwise `imageio-ffmpeg` is used.
+- **Essential**: Install system `ffmpeg` (e.g., `sudo apt install ffmpeg` or via Chocolatey/Scoop on Windows) to use the video compressor.
 
 ---
 
@@ -352,12 +355,12 @@ Purpose
 
 - Recursively convert `.webp`, `.png`, `.jpeg` images to `.jpg` with high-quality settings, while safely skipping unsupported or animated WebP files. Preserves EXIF orientation and metadata when present.
 
-276→Supported formats and behavior
-277→
-278→- Converts: `.webp` (non-animated), `.png`, `.jpeg`
-279→- Skips: `.gif`, videos (`.mp4`, `.mov`, `.avi`, `.mkv`), and animated WebP
-280→- Animated WebP detection: inspects RIFF `WEBP` header and chunks, flags animation via `VP8X` animation bit or presence of `ANIM` chunk; such files are rejected from processing
-281→- Validates images and applies decompression-bomb protections; writes output alongside source file as `same_name.jpg`
+Supported formats and behavior
+
+- Converts: `.webp` (non-animated), `.png`, `.jpeg`
+- Skips: `.gif`, videos (`.mp4`, `.mov`, `.avi`, `.mkv`), and animated WebP
+- Animated WebP detection: inspects RIFF `WEBP` header and chunks, flags animation via `VP8X` animation bit or presence of `ANIM` chunk; such files are rejected from processing
+- Validates images and applies decompression-bomb protections; writes output alongside source file as `same_name.jpg`
 
 Parameters
 
@@ -394,6 +397,55 @@ Troubleshooting
 Version Compatibility
 
 - Python 3.8+; tested with Pillow 9–11 and tqdm 4.x
+
+---
+
+### 6) Video Compressor (`compress_videos.py`)
+
+Purpose
+
+- Batch compress videos (mp4, mov, avi, mkv) using FFmpeg with configurable codec (H.264/H.265), CRF (quality), and preset (speed). Replaces original files only if compression yields a smaller file size.
+
+Functionality
+
+- **Batch Processing**: Scans folder or processes single file.
+- **Smart Replacement**: Calculates metrics (SSIM/PSNR) and replaces original only if size is reduced.
+- **Progress Tracking**: Shows compression progress, speed, and size reduction ratio.
+- **Interruption Safety**: Graceful exit on ESC key, cleaning up temporary files.
+
+Parameters
+
+| Parameter | Type | Default | Required | Description |
+|---|---|---:|:---:|---|
+| `--input` | `str` | none | Yes (or interactive prompt) | Input folder or single video file path. |
+| `--codec` | `str` | `h265` | No | Codec to use: `h264` or `h265`. |
+| `--crf` | `int` | `23` | No | Constant Rate Factor (0-51). Lower is better quality. |
+| `--preset` | `str` | `medium` | No | FFmpeg preset (e.g., fast, medium, slow). |
+| `--dry-run` | `flag` | `False` | No | Simulate compression without modifying files. |
+
+Examples
+
+```bash
+# Compress all videos in a folder with default settings (H.265, CRF 23)
+python compress_videos.py --input C:\videos
+
+# High quality H.264 compression
+python compress_videos.py --input video.mp4 --codec h264 --crf 18 --preset slow
+
+# Dry run to see what would happen
+python compress_videos.py --input C:\videos --dry-run
+```
+
+Dependencies / Prerequisites
+
+- **System `ffmpeg` and `ffprobe` MUST be on PATH.**
+- `tqdm`: `pip install tqdm`
+
+Troubleshooting
+
+- "ffmpeg/ffprobe not found" → Install FFmpeg and add to system PATH.
+- "unsupported type" → Ensure file is .mp4, .mov, .avi, or .mkv.
+- Compression cancelled → Pressing ESC stops the process safely.
 
 ---
 

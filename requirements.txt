@@ -1,6 +1,6 @@
 # Consolidated Requirements for Py_Console tools
 # Derived from imports across all Python files in this repo.
-# Covers: enhanced_video_downloader.py, video_to_gif.py, secure_sort_by_known_faces.py, and image_processor_suite package.
+# Covers: enhanced_video_downloader.py, video_to_gif.py, secure_sort_by_known_faces.py, compress_videos.py, video_segmenter.py, convert_webp_to_jpg.py
 
 # Core downloader + scraping
 requests>=2.25.0
@@ -26,4 +26,3 @@ face-recognition-models>=0.3.0
 # Notes
 # - ffmpeg is provided via imageio-ffmpeg or system PATH.
 # - tkinter GUI is part of Python (no pip install).
-# - Packaging tools like setuptools are used only for the suite's setup.py.
