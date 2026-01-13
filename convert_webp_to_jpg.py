@@ -10,11 +10,23 @@ try:
 except Exception:
     _HAS_MSVC = False
 
+# HEIC support
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    _HAS_HEIC = True
+except ImportError:
+    _HAS_HEIC = False
+    print("[WARN] pillow-heif not found. .heic support disabled.")
+
 # Safety: mitigate decompression bombs
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 Image.MAX_IMAGE_PIXELS = 80_000_000  # ~50MP cap; adjust if needed
 
-CONVERTIBLE_EXTS = ('.webp', '.png', '.jpeg')
+CONVERTIBLE_EXTS = ['.webp', '.png', '.jpeg']
+if _HAS_HEIC:
+    CONVERTIBLE_EXTS.append('.heic')
+CONVERTIBLE_EXTS = tuple(CONVERTIBLE_EXTS)
 SKIP_EXTS = ('.gif', '.jpg')  # .jpg is already target; .gif we skip per original code
 
 def is_webp_animated(path: str) -> Tuple[bool, str]:
@@ -91,6 +103,11 @@ def convert_one(file_path: str) -> Tuple[bool, str]:
 
         # Convert to RGB JPG
         with Image.open(file_path) as im:
+            # Check for HEIC animation/multi-frame
+            if _HAS_HEIC and file_path.lower().endswith('.heic'):
+                if getattr(im, 'is_animated', False) or getattr(im, 'n_frames', 1) > 1:
+                    return (False, "animated/multi-frame heic")
+
             # Verify content
             try:
                 im.verify()

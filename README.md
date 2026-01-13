@@ -349,17 +349,17 @@ Version Compatibility
 
 ---
 
-### 5) Convert WebP/PNG/JPEG to JPG (`convert_webp_to_jpg.py`)
+### 5) Convert WebP/PNG/JPEG/HEIC to JPG (`convert_webp_to_jpg.py`)
 
 Purpose
 
-- Recursively convert `.webp`, `.png`, `.jpeg` images to `.jpg` with high-quality settings, while safely skipping unsupported or animated WebP files. Preserves EXIF orientation and metadata when present.
+- Recursively convert `.webp`, `.png`, `.jpeg`, and `.heic` images to `.jpg` with high-quality settings, while safely skipping unsupported or animated WebP/HEIC files. Preserves EXIF orientation and metadata when present.
 
 Supported formats and behavior
 
-- Converts: `.webp` (non-animated), `.png`, `.jpeg`
-- Skips: `.gif`, videos (`.mp4`, `.mov`, `.avi`, `.mkv`), and animated WebP
-- Animated WebP detection: inspects RIFF `WEBP` header and chunks, flags animation via `VP8X` animation bit or presence of `ANIM` chunk; such files are rejected from processing
+- Converts: `.webp` (non-animated), `.png`, `.jpeg`, `.heic`
+- Skips: `.gif`, videos (`.mp4`, `.mov`, `.avi`, `.mkv`), animated WebP, and multi-frame HEIC
+- Animated WebP/HEIC detection: inspects headers and frames; such files are rejected from processing to preserve animation source
 - Validates images and applies decompression-bomb protections; writes output alongside source file as `same_name.jpg`
 
 Parameters
@@ -385,18 +385,20 @@ python convert_webp_to_jpg.py
 Dependencies / Prerequisites
 
 - `Pillow` (image IO): `pip install pillow`
+- `pillow-heif` (HEIC support): `pip install pillow-heif`
 - `tqdm` (progress bar): `pip install tqdm`
 
 Troubleshooting
 
 - "ModuleNotFoundError: PIL" → Install Pillow: `pip install pillow`
-- Animated WebP skipped → Expected behavior: "animated webp: skipped"; convert only first frame via a different tool if needed.
+- "ModuleNotFoundError: pillow_heif" → Install pillow-heif: `pip install pillow-heif`
+- Animated WebP/HEIC skipped → Expected behavior: "animated webp: skipped" or "animated/multi-frame heic"; convert only first frame via a different tool if needed.
 - "unsupported type or extension" → File does not match convertible set or magic header; ensure file is a valid image.
 - Decompression bomb error → Large images can trip safety caps; adjust `Image.MAX_IMAGE_PIXELS` in the script if you must handle very large images.
 
 Version Compatibility
 
-- Python 3.8+; tested with Pillow 9–11 and tqdm 4.x
+- Python 3.8+; tested with Pillow 9–11, pillow-heif, and tqdm 4.x
 
 ---
 
