@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
 """
-secure_sort_by_known_faces_optimized.py (enhanced progress tracking, optimized performance)
+secure_sort_by_known_faces.py (robust, quiet output, interactive if needed)
 
-Key improvements:
-- Clean, unified progress tracking system
-- Better visual feedback with stage indicators
-- Optimized memory usage and performance
-- Enhanced error handling and recovery
-- Maintains all existing functionality
+Key features:
+- Quiet runtime: only a single tqdm progress bar and a concise final summary.
+- Progress bar shows: moved={total_moved} plus per-destination counts beside bar.
+- Interactive input if CLI args are missing: prompts for src, recursive, tolerance,
+  workers, jitter, and an arbitrary number of (face, dest) pairs.
+- Safe filesystem operations: unique naming, traversal prevention, size/pixel caps.
+- Parallelized face analysis; single-threaded file moves.
+- Moves to first matched destination only (no extra copies).
+- Series continuation: detects existing numbered series and continues numbering.
 
 Dependencies:
   pip install face_recognition pillow tqdm
+
+Usage Examples:
+  # Face-based sorting
+  python secure_sort_by_known_faces.py --src /photos --recursive --face person1.jpg --dest /photos/person1
+  
+  # Series grouping with continuation (default behavior)
+  python secure_sort_by_known_faces.py --src /photos --series-mode date --series-prefix vacation
+  
+  # Series grouping without continuation (start from 001)
+  python secure_sort_by_known_faces.py --src /photos --series-mode date --no-continue-series
 """
 
 import argparse
@@ -18,11 +31,8 @@ import os
 import re
 import sys
 import shutil
-import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
-from dataclasses import dataclass
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
     import face_recognition
@@ -31,6 +41,7 @@ except ImportError:
 import numpy as np
 from PIL import Image, UnidentifiedImageError, ImageFile
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Pillow hardening / safety
 ImageFile.LOAD_TRUNCATED_IMAGES = False
@@ -40,171 +51,8 @@ VALID_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 MAX_BYTES = 50 * 1024 * 1024  # 50 MB per file
 CPU_MAX_FACTOR = 4  # cap workers to <= CPU cores * factor
 
-
-@dataclass
-class ProcessingStats:
-    """Track processing statistics for better progress feedback."""
-    total_images: int = 0
-    processed_images: int = 0
-    matched_images: int = 0
-    unmatched_images: int = 0
-    errors: int = 0
-    moved_to_dest: Dict[str, int] = None
-    start_time: float = 0
-    
-    def __post_init__(self):
-        if self.moved_to_dest is None:
-            self.moved_to_dest = {}
-        self.start_time = time.time()
-    
-    @property
-    def progress_percentage(self) -> float:
-        return (self.processed_images / max(1, self.total_images)) * 100
-    
-    @property
-    def elapsed_time(self) -> float:
-        return time.time() - self.start_time
-    
-    @property
-    def processing_rate(self) -> float:
-        elapsed = self.elapsed_time
-        return self.processed_images / max(1, elapsed)
-
-
-class EnhancedProgressTracker:
-    """Enhanced progress tracking with clean, informative output."""
-    
-    def __init__(self, total_images: int, mode: str = "face_analysis"):
-        self.total_images = total_images
-        self.mode = mode
-        self.stats = ProcessingStats(total_images=total_images)
-        self.main_pbar = None
-        self.stage_pbar = None
-        
-        if tqdm is not None:
-            self._setup_progress_bars()
-    
-    def _setup_progress_bars(self):
-        """Setup clean, informative progress bars."""
-        if self.mode == "face_analysis":
-            # Main progress bar for face analysis
-            self.main_pbar = tqdm(
-                total=self.total_images,
-                desc="🔍 Analyzing Images",
-                unit="img",
-                bar_format='{desc}: {bar:20} | {n_fmt}/{total_fmt} | {percentage:3.0f}% | [{elapsed}<{remaining}]',
-                position=0,
-                leave=True
-            )
-        elif self.mode == "series":
-            # Progress bar for series renaming
-            self.main_pbar = tqdm(
-                total=self.total_images,
-                desc="📁 Organizing Series",
-                unit="img",
-                bar_format='{desc}: {bar:20} | {n_fmt}/{total_fmt} | {percentage:3.0f}% | [{elapsed}<{remaining}]',
-                position=0,
-                leave=True
-            )
-    
-    def update_stage(self, stage_name: str, progress: Optional[float] = None):
-        """Update current processing stage."""
-        if self.stage_pbar:
-            self.stage_pbar.close()
-        
-        if tqdm is not None and progress is not None:
-            self.stage_pbar = tqdm(
-                total=100,
-                desc=f"  {stage_name}",
-                unit="%",
-                bar_format='{desc}: {bar:20} | {percentage:3.0f}%',
-                position=1,
-                leave=False
-            )
-            self.stage_pbar.update(progress)
-    
-    def update_main_progress(self, increment: int = 1, **postfix_data):
-        """Update main progress bar with detailed information."""
-        self.stats.processed_images += increment
-        
-        if self.main_pbar:
-            # Build informative postfix
-            postfix_parts = []
-            
-            if self.stats.matched_images > 0:
-                postfix_parts.append(f"✓{self.stats.matched_images}")
-            
-            if self.stats.unmatched_images > 0:
-                postfix_parts.append(f"✗{self.stats.unmatched_images}")
-            
-            if self.stats.errors > 0:
-                postfix_parts.append(f"⚠{self.stats.errors}")
-            
-            # Add destination counts if available
-            if self.stats.moved_to_dest:
-                dest_counts = [f"{Path(d).name}:{count}" 
-                              for d, count in self.stats.moved_to_dest.items() if count > 0]
-                if dest_counts:
-                    postfix_parts.append(f"📁{' '.join(dest_counts)}")
-            
-            # Add processing rate
-            rate = self.stats.processing_rate
-            if rate > 0:
-                postfix_parts.append(f"🚀{rate:.1f}/s")
-            
-            postfix_str = " | ".join(postfix_parts) if postfix_parts else ""
-            
-            self.main_pbar.set_postfix_str(postfix_str)
-            self.main_pbar.update(increment)
-    
-    def add_match(self, dest_name: str):
-        """Record a successful match."""
-        self.stats.matched_images += 1
-        if dest_name not in self.stats.moved_to_dest:
-            self.stats.moved_to_dest[dest_name] = 0
-        self.stats.moved_to_dest[dest_name] += 1
-    
-    def add_unmatched(self):
-        """Record an unmatched image."""
-        self.stats.unmatched_images += 1
-    
-    def add_error(self):
-        """Record an error."""
-        self.stats.errors += 1
-    
-    def close(self):
-        """Clean up progress bars."""
-        if self.stage_pbar:
-            self.stage_pbar.close()
-        if self.main_pbar:
-            self.main_pbar.close()
-    
-    def print_summary(self):
-        """Print a clean, informative summary."""
-        print(f"\n{'='*60}")
-        print(f"📊 PROCESSING COMPLETE")
-        print(f"{'='*60}")
-        print(f"📁 Total images:     {self.stats.total_images}")
-        print(f"✅ Matched:         {self.stats.matched_images}")
-        print(f"❌ Unmatched:       {self.stats.unmatched_images}")
-        if self.stats.errors > 0:
-            print(f"⚠️  Errors:          {self.stats.errors}")
-        print(f"⏱️  Time elapsed:    {self.stats.elapsed_time:.1f}s")
-        print(f"🚀 Processing rate: {self.stats.processing_rate:.1f} img/s")
-        
-        if self.stats.moved_to_dest:
-            print(f"\n📂 Files moved to destinations:")
-            for dest, count in self.stats.moved_to_dest.items():
-                if count > 0:
-                    print(f"   {Path(dest).name}: {count} files")
-        
-        success_rate = (self.stats.matched_images / max(1, self.stats.total_images)) * 100
-        print(f"\n🎯 Success rate: {success_rate:.1f}%")
-        print(f"{'='*60}")
-
-
 # -------------------------
-# Utilities (unchanged for compatibility)
+# Utilities
 # -------------------------
 
 def is_image_path(p: Path) -> bool:
@@ -280,49 +128,29 @@ def load_ref_encoding(image_path: Path, jitter: int) -> Optional[list]:
         return None
 
 def collect_images(src: Path, recursive: bool) -> List[Path]:
-    """Optimized image collection with progress feedback."""
     paths: List[Path] = []
-    
     if recursive:
-        # Count total files first for better progress estimation
-        total_files = sum(len(files) for _, _, files in os.walk(src))
-        
-        with tqdm(total=total_files, desc="🔍 Scanning Files", unit="file", 
-                 bar_format='{desc}: {bar:20} | {n_fmt}/{total_fmt} | [{elapsed}<{remaining}]',
-                 position=0, leave=True) as scan_pbar:
-            
-            for root, _, files in os.walk(src, topdown=True):
-                root_path = Path(root)
-                for fname in files:
-                    p = root_path / fname
-                    try:
-                        if p.exists() and not p.is_dir() and is_image_path(p):
-                            paths.append(p)
-                    except Exception:
-                        continue
-                    finally:
-                        scan_pbar.update(1)
+        for root, _, files in os.walk(src, topdown=True):
+            root_path = Path(root)
+            for fname in files:
+                p = root_path / fname
+                try:
+                    if p.exists() and not p.is_dir() and is_image_path(p):
+                        paths.append(p)
+                except Exception:
+                    continue
     else:
         try:
-            files = list(src.iterdir())
-            with tqdm(total=len(files), desc="🔍 Scanning Files", unit="file",
-                     bar_format='{desc}: {bar:20} | {n_fmt}/{total_fmt} | [{elapsed}<{remaining}]',
-                     position=0, leave=True) as scan_pbar:
-                
-                for p in files:
-                    try:
-                        if p.exists() and not p.is_dir() and is_image_path(p):
-                            paths.append(p)
-                    except Exception:
-                        continue
-                    finally:
-                        scan_pbar.update(1)
+            for p in src.iterdir():
+                try:
+                    if p.exists() and not p.is_dir() and is_image_path(p):
+                        paths.append(p)
+                except Exception:
+                    continue
         except PermissionError:
             return []
-    
     return paths
 
-# Series grouping functions (unchanged for compatibility)
 def _series_group_by_date(images: List[Path], threshold_minutes: int) -> List[List[Path]]:
     if not images:
         return []
@@ -393,25 +221,61 @@ def _series_group_by_visual(images: List[Path], threshold: float) -> List[List[P
             groups.append([img])
     return groups
 
-def _rename_series_groups(groups: List[List[Path]], prefix: str) -> None:
-    """Enhanced series renaming with better progress tracking."""
-    total_images = sum(len(g) for g in groups)
+def validate_series_prefix(prefix: str) -> str:
+    """
+    Validate and sanitize series prefix.
+    """
+    if not prefix or not prefix.strip():
+        return "series"
+    return sanitize_filename(prefix.strip())
+
+def detect_existing_series(images: List[Path], prefix: str) -> Dict[str, int]:
+    """
+    Detect existing numbered series in images and return the highest series number for each prefix.
+    """
+    series_pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)_(\d+)")
+    existing_series: Dict[str, int] = {}
     
+    for img in images:
+        match = series_pattern.match(img.stem)
+        if match:
+            series_num = int(match.group(1))
+            existing_series[prefix] = max(existing_series.get(prefix, 0), series_num)
+    
+    return existing_series
+
+def get_next_series_number(existing_series: Dict[str, int], prefix: str) -> int:
+    """
+    Get the next series number based on existing series.
+    """
+    return existing_series.get(prefix, 0) + 1
+
+def _rename_series_groups(groups: List[List[Path]], prefix: str, continue_series: bool = True) -> None:
+    """
+    Rename series groups with optional continuation of existing numbering.
+    """
+    total_images = sum(len(g) for g in groups)
     if total_images == 0:
         return
     
-    tracker = EnhancedProgressTracker(total_images, mode="series")
+    # Detect existing series if continuation is enabled
+    all_images = [img for group in groups for img in group]
+    existing_series = detect_existing_series(all_images, prefix) if continue_series else {}
+    series_index = get_next_series_number(existing_series, prefix)
     
-    try:
-        series_index = 1
-        for group in groups:
+    use_tqdm = "tqdm" in globals() and tqdm is not None
+    
+    with tqdm(total=total_images, desc="Renaming series", unit="img", 
+               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as bar:
+        for group_idx, group in enumerate(groups, 1):
             group_sorted = sorted(group, key=lambda p: p.stat().st_mtime)
             series_label = sanitize_filename(f"{prefix}_{series_index:03d}")
             count = 1
             
-            tracker.update_stage(f"Series {series_index:03d}", 0)
+            # Update progress bar description with current series info
+            bar.set_description(f"Series {series_index:03d} ({len(group)} imgs)")
             
-            for i, img in enumerate(group_sorted):
+            for img in group_sorted:
                 ext = img.suffix.lower()
                 new_base = f"{series_label}_{count:03d}{ext}"
                 dest_dir = img.parent
@@ -425,23 +289,21 @@ def _rename_series_groups(groups: List[List[Path]], prefix: str) -> None:
                     img.unlink(missing_ok=False)
                 
                 count += 1
+                bar.update(1)
                 
-                # Update progress within current series
-                series_progress = ((i + 1) / len(group_sorted)) * 100
-                tracker.update_stage(f"Series {series_index:03d}", series_progress)
-                tracker.update_main_progress()
+                # Update postfix with current progress
+                bar.set_postfix({
+                    'series': f"{series_index}/{len(groups)}",
+                    'in_series': f"{count-1}/{len(group)}"
+                })
             
             series_index += 1
-    
-    finally:
-        tracker.close()
 
 # -------------------------
 # Worker (parallel)
 # -------------------------
 
 def _analyze_image_worker(img_path_str: str, tolerance: float, known_encs: List, jitter: int) -> tuple:
-    """Optimized worker function with better error handling."""
     try:
         if face_recognition is None:
             raise RuntimeError("face_recognition dependency is not available")
@@ -460,7 +322,7 @@ def _analyze_image_worker(img_path_str: str, tolerance: float, known_encs: List,
         return (img_path_str, False, [False] * len(known_encs), str(e))
 
 # -------------------------
-# CLI + Interactive prompts (unchanged for compatibility)
+# CLI + Interactive prompts
 # -------------------------
 
 def parse_args() -> argparse.Namespace:
@@ -478,6 +340,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--series-threshold-minutes", type=int, default=30, help="Max gap (minutes) within a date-based series")
     ap.add_argument("--series-visual-threshold", type=float, default=0.25, help="Max distance for visual series grouping (0-1)")
     ap.add_argument("--series-prefix", type=str, default="series", help="Prefix for renamed series files")
+    ap.add_argument("--no-continue-series", action="store_true", help="Do not continue existing series numbering (start from 001)")
     return ap.parse_args()
 
 def prompt_bool(prompt: str, default: bool) -> bool:
@@ -579,7 +442,9 @@ def interactive_fill(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 def run_series_mode(args: argparse.Namespace) -> None:
-    """Enhanced series mode with better progress tracking."""
+    """
+    Run series grouping and renaming mode.
+    """
     if args.src is None:
         while args.src is None:
             src_str = input("Source folder: ").strip()
@@ -595,112 +460,171 @@ def run_series_mode(args: argparse.Namespace) -> None:
         if use_rec in ("y", "yes"):
             args.recursive = True
     
-    print(f"🔍 Collecting images from {args.src}...")
+    # Validate and sanitize series prefix
+    args.series_prefix = validate_series_prefix(args.series_prefix)
+    
     images = collect_images(args.src, args.recursive)
     total = len(images)
-    
     if total == 0:
-        print("❌ No images found.")
+        print("No images found.")
         return
     
-    print(f"📊 Found {total} images")
+    # Check for existing series before processing
+    existing_series = detect_existing_series(images, args.series_prefix)
+    continue_series = not args.no_continue_series
     
-    # Process grouping
-    if args.series_mode == "date":
-        if args.series_threshold_minutes <= 0:
-            print("❌ Invalid series-threshold-minutes; must be > 0.")
-            sys.exit(2)
-        groups = _series_group_by_date(images, args.series_threshold_minutes)
-    elif args.series_mode == "name":
-        groups = _series_group_by_name(images)
+    if existing_series and continue_series:
+        max_series = max(existing_series.values())
+        next_series = get_next_series_number(existing_series, args.series_prefix)
+        print(f"[INFO] Detected existing series '{args.series_prefix}' up to #{max_series:03d}")
+        print(f"[INFO] Will continue numbering from #{next_series:03d}")
+    elif args.no_continue_series:
+        print("[INFO] Starting fresh series numbering from 001")
     else:
-        if args.series_visual_threshold <= 0:
-            print("❌ Invalid series-visual-threshold; must be > 0.")
-            sys.exit(2)
-        groups = _series_group_by_visual(images, args.series_visual_threshold)
+        print("[INFO] No existing series detected, starting from 001")
+    
+    # Group images
+    try:
+        if args.series_mode == "date":
+            if args.series_threshold_minutes <= 0:
+                print("Invalid series-threshold-minutes; must be > 0.")
+                sys.exit(2)
+            groups = _series_group_by_date(images, args.series_threshold_minutes)
+        elif args.series_mode == "name":
+            groups = _series_group_by_name(images)
+        else:  # visual
+            if args.series_visual_threshold <= 0:
+                print("Invalid series-visual-threshold; must be > 0.")
+                sys.exit(2)
+            groups = _series_group_by_visual(images, args.series_visual_threshold)
+    except Exception as e:
+        print(f"[ERROR] Failed to group images: {e}")
+        sys.exit(2)
     
     if not groups:
-        print("❌ No groups formed.")
+        print("No groups formed.")
         return
     
-    print(f"📁 Grouped {total} images into {len(groups)} series:")
+    print(f"[INFO] Grouped {total} images into {len(groups)} series")
     for idx, g in enumerate(groups, 1):
-        print(f"   Series {idx:03d}: {len(g)} images")
+        print(f" Series {idx:03d}: {len(g)} images")
     
-    _rename_series_groups(groups, args.series_prefix)
-    print("✅ Series grouping and renaming completed.")
+    # Confirm before renaming if there are existing series
+    if existing_series and continue_series:
+        confirm = input(f"\nContinue renaming {total} images? [y/N]: ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Operation cancelled.")
+            return
+    
+    # Rename with series continuation
+    try:
+        _rename_series_groups(groups, args.series_prefix, continue_series)
+        print("Series grouping and renaming completed.")
+    except Exception as e:
+        print(f"[ERROR] Failed during renaming: {e}")
+        sys.exit(2)
 
 # -------------------------
-# Main (enhanced with better progress tracking)
+# Main
 # -------------------------
 
 def main():
     args = parse_args()
     if args.series_mode and (args.face or args.dest):
-        print("❌ Cannot use --face/--dest together with --series-mode.")
+        print("Cannot use --face/--dest together with --series-mode.")
         sys.exit(2)
     if args.series_mode:
         print(f"[MODE] Series mode: {args.series_mode}")
         run_series_mode(args)
         return
     if face_recognition is None:
-        print("❌ Face-based mode requires 'face_recognition'. Install it or use --series-mode.")
-        sys.exit(1)
+        print("Face-based mode requires 'face_recognition'. Install it or use --series-mode.")
+        sys.exit(2)
     print("[MODE] Face-based authentication mode")
     args = interactive_fill(args)
-    
-    print(f"🔍 Collecting images from {args.src}...")
     images = collect_images(args.src, args.recursive)
     total = len(images)
-    
     if total == 0:
-        print("❌ No images found.")
+        print("No images found.")
         return
 
     known_encs = [enc for _, _, enc in args._mapping]
     dest_dirs = [dest for _, dest, _ in args._mapping]
-    
-    # Initialize enhanced progress tracker
-    tracker = EnhancedProgressTracker(total, mode="face_analysis")
-    
+    moved_to: Dict[str, int] = {str(d): 0 for d in dest_dirs}
+    unmatched = 0
+    errors = 0
+    total_moved = 0
+
+    print(f"[INFO] Processing {total} images from {args.src}")
+
     try:
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
             futures = [ex.submit(_analyze_image_worker, str(p), args.tolerance, known_encs, args.jitter) for p in images]
-            
-            for fut in as_completed(futures):
-                img_path_str, has_faces, match_bools, err = fut.result()
-                img_path = Path(img_path_str)
+            with tqdm(total=total, desc="Processing images", unit="img", 
+                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+                for fut in as_completed(futures):
+                    img_path_str, has_faces, match_bools, err = fut.result()
+                    img_path = Path(img_path_str)
 
-                if err:
-                    tracker.add_error()
-                    tracker.update_main_progress()
-                    continue
-                
-                if not has_faces:
-                    tracker.add_unmatched()
-                    tracker.update_main_progress()
-                    continue
-                
-                matches = [i for i, ok in enumerate(match_bools) if ok]
-                if not matches:
-                    tracker.add_unmatched()
-                    tracker.update_main_progress()
-                    continue
-                
-                first_dest = dest_dirs[matches[0]]
-                try:
-                    _ = safe_move(img_path, first_dest)
-                    tracker.add_match(str(first_dest))
-                except Exception:
-                    tracker.add_error()
-                
-                tracker.update_main_progress()
+                    if err:
+                        errors += 1
+                        pbar.set_postfix({
+                            'moved': total_moved,
+                            'unmatched': unmatched,
+                            'errors': errors
+                        })
+                        pbar.update(1)
+                        continue
+                        
+                    if not has_faces:
+                        unmatched += 1
+                        pbar.set_postfix({
+                            'moved': total_moved,
+                            'unmatched': unmatched,
+                            'errors': errors
+                        })
+                        pbar.update(1)
+                        continue
+                        
+                    matches = [i for i, ok in enumerate(match_bools) if ok]
+                    if not matches:
+                        unmatched += 1
+                        pbar.set_postfix({
+                            'moved': total_moved,
+                            'unmatched': unmatched,
+                            'errors': errors
+                        })
+                        pbar.update(1)
+                        continue
+                        
+                    first_dest = dest_dirs[matches[0]]
+                    try:
+                        _ = safe_move(img_path, first_dest)
+                        moved_to[str(first_dest)] += 1
+                        total_moved += 1
+                    except Exception:
+                        errors += 1
+                    
+                    # Update progress bar postfix with detailed stats
+                    per_dest_str = ", ".join([f"{Path(d).name}:{moved_to[str(d)]}" for d in dest_dirs if moved_to[str(d)] > 0])
+                    pbar.set_postfix({
+                        'moved': total_moved,
+                        'unmatched': unmatched,
+                        'errors': errors,
+                        'destinations': per_dest_str if per_dest_str else 'none'
+                    })
+                    pbar.update(1)
 
     except KeyboardInterrupt:
-        print("\n⚠️ Interrupted by user")
-    finally:
-        tracker.close()
-        tracker.print_summary()
+        print("\n[INFO] Interrupted by user")
+
+    print("\n[SUMMARY]")
+    for d in dest_dirs:
+        print(f" {d}: {moved_to[str(d)]} moved")
+    print(f" Total moved: {total_moved}")
+    print(f" Unmatched/no-face: {unmatched}")
+    if errors:
+        print(f" Errors: {errors}")
 
 if __name__ == "__main__":
     main()

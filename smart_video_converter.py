@@ -44,11 +44,12 @@ except ImportError:
     print("Error: moviepy is required. Install with: pip install moviepy")
     sys.exit(1)
 
+# Recycle bin functionality
 try:
-    import imageio
+    import send2trash
+    SEND2TRASH_AVAILABLE = True
 except ImportError:
-    print("Error: imageio is required. Install with: pip install imageio")
-    sys.exit(1)
+    SEND2TRASH_AVAILABLE = False
 
 try:
     from PIL import Image, ImageSequence
@@ -219,6 +220,7 @@ class ConversionConfig:
     webp_lossless: bool = False
     webp_method: int = 4  # 0-6, higher = better compression, slower
     webp_animation: bool = True
+    use_recycle_bin: bool = True  # Move to recycle bin instead of permanent deletion
     
     # Supported video formats
     supported_formats: tuple = (
@@ -365,26 +367,44 @@ class VideoToGifConverter:
                 self.logger.error(f"Output file too small ({out_size} bytes), keeping source: {source_path}")
                 return False
             original_size = source_path.stat().st_size
-            try:
-                source_path.unlink()
-            except PermissionError as pe:
-                self.logger.error(f"Permission denied deleting source {source_path}: {pe}")
-                return False
-            except FileNotFoundError:
-                # Race condition: already removed
-                pass
-            except OSError as oe:
-                self.logger.error(f"OS error deleting source {source_path}: {oe}")
-                return False
+            
+            # Use recycle bin if available and enabled
+            if self.config.use_recycle_bin and SEND2TRASH_AVAILABLE:
+                try:
+                    send2trash.send2trash(str(source_path))
+                    self.logger.info(f"Moved to recycle bin: {source_path} (saved {original_size / (1024*1024):.1f}MB)")
+                except Exception as e:
+                    self.logger.error(f"Failed to move to recycle bin {source_path}: {e}")
+                    return False
+            else:
+                # Fallback to permanent deletion
+                if self.config.use_recycle_bin and not SEND2TRASH_AVAILABLE:
+                    self.logger.warning("Recycle bin not available, permanently deleting file")
+                
+                try:
+                    source_path.unlink()
+                except PermissionError as pe:
+                    self.logger.error(f"Permission denied deleting source {source_path}: {pe}")
+                    return False
+                except FileNotFoundError:
+                    # Race condition: already removed
+                    pass
+                except OSError as oe:
+                    self.logger.error(f"OS error deleting source {source_path}: {oe}")
+                    return False
 
             # Verify removal
             if source_path.exists():
                 self.logger.error(f"Deletion verification failed; source still exists: {source_path}")
                 return False
+            
             with self._lock:
                 self._conversion_stats['files_deleted'] += 1
                 self._conversion_stats['total_size_saved'] += original_size
-            self.logger.info(f"Successfully deleted source file: {source_path} (saved {original_size / (1024*1024):.1f}MB)")
+            
+            if not (self.config.use_recycle_bin and SEND2TRASH_AVAILABLE):
+                self.logger.info(f"Successfully deleted source file: {source_path} (saved {original_size / (1024*1024):.1f}MB)")
+            
             return True
         except Exception as e:
             self.logger.error(f"Error deleting source file {source_path}: {e}")
@@ -1219,6 +1239,102 @@ class VideoToGifConverter:
         return results
 
 
+def ai_select_format(input_path: Path) -> str:
+    """AI-powered format selection based on input characteristics and user preferences."""
+    print("\n🤖 AI Format Selection")
+    print("=" * 40)
+    
+    # Analyze input characteristics
+    is_directory = input_path.is_dir()
+    
+    if is_directory:
+        # For batch processing, analyze a few sample files
+        video_files = []
+        for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']:
+            video_files.extend(input_path.glob(f"*{ext}"))
+            video_files.extend(input_path.glob(f"*{ext.upper()}"))
+        
+        if not video_files:
+            print("📁 No video files found in directory. Defaulting to GIF format.")
+            return 'gif'
+        
+        # Analyze first few files
+        sample_files = video_files[:3]
+        total_size_mb = sum(f.stat().st_size for f in sample_files) / (1024 * 1024)
+        avg_size_mb = total_size_mb / len(sample_files)
+        
+        print(f"📊 Batch Analysis:")
+        print(f"   • Total videos found: {len(video_files)}")
+        print(f"   • Sample files analyzed: {len(sample_files)}")
+        print(f"   • Average file size: {avg_size_mb:.1f}MB")
+        
+        # AI recommendation logic for batch
+        if len(video_files) > 10:
+            recommendation = 'webp'
+            reason = "Large batch processing - WebP offers better compression and quality"
+        elif avg_size_mb > 50:
+            recommendation = 'webp'
+            reason = "Large file sizes detected - WebP provides superior compression"
+        else:
+            recommendation = 'gif'
+            reason = "Moderate batch size - GIF offers universal compatibility"
+    
+    else:
+        # Single file analysis
+        try:
+            file_size_mb = input_path.stat().st_size / (1024 * 1024)
+            print(f"📊 File Analysis:")
+            print(f"   • File size: {file_size_mb:.1f}MB")
+            print(f"   • File name: {input_path.name}")
+            
+            # AI recommendation logic for single file
+            if file_size_mb > 100:
+                recommendation = 'webp'
+                reason = "Large file size - WebP will provide better compression"
+            elif 'gif' in input_path.name.lower() or 'animated' in input_path.name.lower():
+                recommendation = 'gif'
+                reason = "File appears to be animation-related - GIF format recommended"
+            elif file_size_mb < 10:
+                recommendation = 'gif'
+                reason = "Small file size - GIF will be lightweight and compatible"
+            else:
+                recommendation = 'webp'
+                reason = "Moderate file size - WebP offers better quality/size ratio"
+        
+        except Exception:
+            recommendation = 'gif'
+            reason = "Unable to analyze file - Defaulting to GIF for compatibility"
+    
+    print(f"\n🎯 AI Recommendation: {recommendation.upper()}")
+    print(f"💡 Reason: {reason}")
+    
+    # Interactive confirmation
+    while True:
+        user_choice = input(f"\nUse {recommendation.upper()} format? [Y/n]: ").strip().lower()
+        
+        if user_choice in ('', 'y', 'yes'):
+            print(f"✅ Selected: {recommendation.upper()}")
+            return recommendation
+        elif user_choice in ('n', 'no'):
+            # Let user choose manually
+            print("\n📋 Available formats:")
+            print("   1. GIF - Universal compatibility, good for simple animations")
+            print("   2. WebP - Better compression, supports transparency, higher quality")
+            
+            while True:
+                format_choice = input("Choose format [1/2]: ").strip()
+                if format_choice == '1':
+                    print("✅ Selected: GIF")
+                    return 'gif'
+                elif format_choice == '2':
+                    print("✅ Selected: WebP")
+                    return 'webp'
+                else:
+                    print("❌ Please enter 1 or 2")
+        else:
+            print("❌ Please enter Y or N")
+
+
 def main():
     """Main function for command-line interface."""
     # Setup global ESC termination listener for immediate graceful exit
@@ -1299,8 +1415,8 @@ Deprecated:
     # Format selection and workers
     parser.add_argument(
         '--format',
-        choices=['gif', 'webp'],
-        help='Output format: gif or webp (prompted if omitted)'
+        choices=['gif', 'webp', 'ai'],
+        help='Output format: gif, webp, or ai for AI-assisted selection'
     )
     parser.add_argument(
         '--workers',
@@ -1391,6 +1507,14 @@ Deprecated:
         help=argparse.SUPPRESS
     )
     
+    # Recycle bin control
+    parser.add_argument(
+        '--no-recycle-bin',
+        dest='no_recycle_bin',
+        action='store_true',
+        help='Permanently delete files instead of moving to recycle bin'
+    )
+    
     args = parser.parse_args()
 
     # Handle deprecated flags
@@ -1434,9 +1558,14 @@ Deprecated:
     
     # Create converter with configuration
     config = ConversionConfig()
+    config.use_recycle_bin = not args.no_recycle_bin
     converter = VideoToGifConverter(config=config)
     
     input_path = Path(args.input)
+    
+    # Handle AI format selection
+    if args.format == 'ai':
+        args.format = ai_select_format(input_path)
 
     # Helper: prompt for output format (WEBP/GIF), default WEBP
     def _prompt_format(default: str = 'webp') -> str:
