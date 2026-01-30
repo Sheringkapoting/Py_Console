@@ -3,8 +3,28 @@ import os
 import sys
 import time
 from typing import List, Tuple
+from pathlib import Path
 from PIL import Image, UnidentifiedImageError, ImageFile
 from tqdm import tqdm
+
+# Import shared utilities
+try:
+    from src.scripts.common_utils import format_size, TerminationManager
+    _HAS_COMMON_UTILS = True
+except ImportError:
+    _HAS_COMMON_UTILS = False
+    # Fallback format_size if common_utils not available
+    def format_size(size_bytes: int) -> str:
+        if size_bytes == 0:
+            return "0B"
+        size_names = ("B", "KB", "MB", "GB", "TB")
+        i = 0
+        size = float(size_bytes)
+        while size >= 1024.0 and i < len(size_names) - 1:
+            size /= 1024.0
+            i += 1
+        return f"{size:.1f}{size_names[i]}"
+
 try:
     import msvcrt
     _HAS_MSVC = True
@@ -106,16 +126,6 @@ def target_jpg_path(src_path: str) -> str:
     root, _ = os.path.splitext(src_path)
     return root + ".jpg"
 
-def format_size(size_bytes: int) -> str:
-    """Format bytes in human readable format."""
-    if size_bytes == 0:
-        return "0B"
-    size_names = ["B", "KB", "MB", "GB"]
-    i = 0
-    while size_bytes >= 1024.0 and i < len(size_names) - 1:
-        size_bytes /= 1024.0
-        i += 1
-    return f"{size_bytes:.1f}{size_names[i]}"
 
 def convert_one(file_path: str) -> Tuple[bool, str]:
     """
@@ -204,17 +214,26 @@ def convert_images(folder: str) -> None:
         print("[INFO] No convertible images found (.webp, .png, .jpeg" + (", .heic" if _HAS_HEIC else "") + ").")
         return
 
+    # Pre-calculate metrics for better performance
     converted = 0
     deleted = 0
     failed = 0
     total_original_size = 0
     total_converted_size = 0
     start_time = time.time()
-
-    # Enhanced progress bar with detailed metrics
-    with tqdm(total=total, desc="Converting", unit="img", dynamic_ncols=True, mininterval=0.2, file=sys.stdout,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {rate_fmt}") as pbar:
+    
+    # Optimized progress bar with consistent formatting
+    with tqdm(total=total, desc="Converting", unit="img", dynamic_ncols=True, mininterval=0.1,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+                leave=True) as pbar:
+        
         for file_path in total_candidates:
+            if _HAS_MSVC and msvcrt.kbhit():
+                key = msvcrt.getch()
+                if key == b'\x1b':  # ESC key
+                    print("\n[INFO] Conversion cancelled by user.")
+                    break
+            
             file_start_time = time.time()
             original_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
             total_original_size += original_size
@@ -244,22 +263,14 @@ def convert_images(folder: str) -> None:
             processed = converted + failed
             rate = processed / elapsed if elapsed > 0 else 0
             
-            # Enhanced postfix with comprehensive metrics
-            postfix_items = [
-                f"✓{converted}",
-                f"✗{failed}",
-                f"🗑{deleted}",
-                f"📁{format_size(total_original_size)}",
-                f"📦{format_size(total_converted_size)}"
-            ]
+            # Optimized postfix with essential metrics
+            postfix_dict = {'✓': converted, '✗': failed, '🗑': deleted}
             
             if converted > 0 and total_original_size > 0:
                 overall_ratio = (1 - total_converted_size / total_original_size) * 100
-                postfix_items.append(f"💾{overall_ratio:.1f}%")
+                postfix_dict['saved'] = f"{overall_ratio:.1f}%"
             
-            postfix_items.append(f"⚡{rate:.1f}/s")
-            
-            pbar.set_postfix_str(" | ".join(postfix_items))
+            pbar.set_postfix(postfix_dict, refresh=False)
             pbar.update(1)
 
     # Enhanced final summary
@@ -344,6 +355,7 @@ def compress_jpgs(folder: str) -> None:
     if total == 0:
         print("[INFO] No .jpg files found to compress.")
         return
+        
     compressed = 0
     deleted = 0
     skipped = 0
@@ -356,8 +368,9 @@ def compress_jpgs(folder: str) -> None:
     start_time = time.time()
     
     try:
-        with tqdm(total=total, desc="Compressing", unit="img", dynamic_ncols=True, mininterval=0.2, file=sys.stdout,
-                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {rate_fmt}") as pbar:
+        with tqdm(total=total, desc="Compressing", unit="img", dynamic_ncols=True, mininterval=0.1,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+                    leave=True) as pbar:
             for file_path in jpgs:
                 if _HAS_MSVC and msvcrt.kbhit():
                     key = msvcrt.getch()
@@ -388,21 +401,14 @@ def compress_jpgs(folder: str) -> None:
                 processed = compressed + skipped + failed
                 rate = processed / elapsed if elapsed > 0 else 0
                 
-                # Enhanced postfix with compression metrics
-                postfix_items = [
-                    f"🗜{compressed}",
-                    f"⏭{skipped}",
-                    f"✗{failed}",
-                    f"💾{format_size(total_saved)}"
-                ]
+                # Optimized postfix with compression metrics
+                postfix_dict = {'🗜': compressed, '⏭': skipped, '✗': failed}
                 
                 if total_saved > 0 and total_original_size > 0:
                     avg_compression = (total_saved / total_original_size) * 100
-                    postfix_items.append(f"📉{avg_compression:.1f}%")
+                    postfix_dict['saved'] = f"{avg_compression:.1f}%"
                 
-                postfix_items.append(f"⚡{rate:.1f}/s")
-                
-                pbar.set_postfix_str(" | ".join(postfix_items))
+                pbar.set_postfix(postfix_dict, refresh=False)
                 pbar.update(1)
     except KeyboardInterrupt:
         aborted = True

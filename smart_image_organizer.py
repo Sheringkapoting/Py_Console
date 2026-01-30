@@ -31,8 +31,15 @@ import os
 import re
 import sys
 import shutil
+import warnings
+import threading
+import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
+warnings.filterwarnings("ignore", category=UserWarning, module="face_recognition_models")
 
 try:
     import face_recognition
@@ -47,13 +54,50 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 Image.MAX_IMAGE_PIXELS = 50_000_000  # ~50MP cap
 
-VALID_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+VALID_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
 MAX_BYTES = 50 * 1024 * 1024  # 50 MB per file
 CPU_MAX_FACTOR = 4  # cap workers to <= CPU cores * factor
+
+# Global termination flag
+TERMINATION_FLAG = threading.Event()
 
 # -------------------------
 # Utilities
 # -------------------------
+
+def check_escape_key():
+    """Check for Escape key press in a non-blocking way."""
+    try:
+        import msvcrt
+        if msvcrt.kbhit() and msvcrt.getch() == b'\x1b':  # Escape key
+            return True
+    except ImportError:
+        # Non-Windows platforms - use alternative method
+        try:
+            import select
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(sys.stdin.fileno())
+                if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+                    if sys.stdin.read(1) == '\x1b':
+                        return True
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except (ImportError, OSError):
+            pass
+    return False
+
+def monitor_escape_key():
+    """Background thread to monitor for Escape key presses."""
+    while not TERMINATION_FLAG.is_set():
+        if check_escape_key():
+            TERMINATION_FLAG.set()
+            print("\n[INFO] Termination requested (Esc key pressed)")
+            break
+        time.sleep(0.1)  # Check every 100ms
 
 def is_image_path(p: Path) -> bool:
     return p.suffix.lower() in VALID_EXTS
@@ -101,31 +145,153 @@ def safe_move(src: Path, dest_dir: Path) -> Path:
         return dest
 
 def validate_image(path: Path) -> None:
+    """Validate image file with optimized checks."""
     if not path.exists() or path.is_dir():
         raise ValueError("Not a file path")
     if not is_image_path(path):
         raise ValueError("Unsupported extension")
-    size = path.stat().st_size
-    if size <= 0 or size > MAX_BYTES:
-        raise ValueError(f"Unexpected file size: {size} bytes")
+    
     try:
+        size = path.stat().st_size
+        if size <= 0 or size > MAX_BYTES:
+            raise ValueError(f"Unexpected file size: {size} bytes")
+        
+        # Quick validation without full loading
         with Image.open(path) as im:
             im.verify()
     except (UnidentifiedImageError, Image.DecompressionBombError) as e:
         raise ValueError(f"Invalid image content: {e}")
 
 def load_ref_encoding(image_path: Path, jitter: int) -> Optional[list]:
+    """
+    Load reference face encoding with enhanced face detection and quality checks.
+    """
     try:
         if face_recognition is None:
             raise RuntimeError("face_recognition dependency is not available")
         validate_image(image_path)
         img = face_recognition.load_image_file(str(image_path))
-        encs = face_recognition.face_encodings(img, num_jitters=max(1, int(jitter)))
+        
+        # Detect face locations first
+        face_locations = face_recognition.face_locations(img, model="hog")
+        if not face_locations:
+            return None
+        
+        # Filter faces by size (avoid tiny faces)
+        valid_faces = []
+        img_height, img_width = img.shape[:2]
+        min_face_size = min(img_height, img_width) * 0.1  # 10% of image dimension
+        
+        for i, location in enumerate(face_locations):
+            top, right, bottom, left = location
+            face_width = right - left
+            face_height = bottom - top
+            
+            # Check if face is large enough
+            if face_width >= min_face_size and face_height >= min_face_size:
+                valid_faces.append((i, location))
+        
+        if not valid_faces:
+            return None
+        
+        # Use the largest valid face
+        largest_face = max(valid_faces, key=lambda x: (x[1][1] - x[1][3]) * (x[1][2] - x[1][0]))
+        face_idx = largest_face[0]
+        
+        # Get encodings with higher jitter for better accuracy
+        encs = face_recognition.face_encodings(img, num_jitters=max(1, int(jitter)), known_face_locations=[face_locations[face_idx]])
         if not encs:
             return None
+            
         return encs[0]
     except Exception:
         return None
+
+def analyze_faces_enhanced(img_path: Path, tolerance: float, known_encs: List, jitter: int, 
+                          min_face_size: float = 0.08, max_face_size: float = 0.9, 
+                          face_model: str = "hog", strict_matching: bool = False) -> tuple:
+    """
+    Enhanced face analysis with quality checks and precise matching.
+    Checks for termination flag to allow graceful shutdown.
+    """
+    # Check for termination before processing
+    if TERMINATION_FLAG.is_set():
+        return (str(img_path), False, [False] * len(known_encs), "Terminated by user")
+        
+    try:
+        if face_recognition is None:
+            raise RuntimeError("face_recognition dependency is not available")
+        
+        # Validate image once at the beginning
+        validate_image(img_path)
+        img = face_recognition.load_image_file(str(img_path))
+        
+        # Detect face locations with fallback
+        try:
+            face_locations = face_recognition.face_locations(img, model=face_model)
+        except:
+            face_locations = face_recognition.face_locations(img, model="hog")
+        
+        if not face_locations:
+            return (str(img_path), False, [False] * len(known_encs), None)
+        
+        # Filter faces by quality with optimized calculations
+        img_height, img_width = img.shape[:2]
+        min_face_pixels = min(img_height, img_width) * min_face_size
+        max_face_pixels = min(img_height, img_width) * max_face_size
+        
+        valid_faces = []
+        for i, location in enumerate(face_locations):
+            top, right, bottom, left = location
+            face_width = right - left
+            face_height = bottom - top
+            aspect_ratio = face_width / face_height if face_height > 0 else 0
+            
+            # Optimized size and aspect ratio checks
+            if (min_face_pixels <= face_width <= max_face_pixels and 
+                min_face_pixels <= face_height <= max_face_pixels and
+                0.7 <= aspect_ratio <= 1.5):
+                valid_faces.append((i, location))
+        
+        if not valid_faces:
+            return (str(img_path), False, [False] * len(known_encs), None)
+        
+        # Check for termination after face detection
+        if TERMINATION_FLAG.is_set():
+            return (str(img_path), False, [False] * len(known_encs), "Terminated by user")
+            
+        # Get encodings for valid faces only
+        valid_locations = [loc for idx, loc in valid_faces]
+        encodings = face_recognition.face_encodings(img, num_jitters=max(1, int(jitter)), known_face_locations=valid_locations)
+        
+        if not encodings:
+            return (str(img_path), False, [False] * len(known_encs), None)
+        
+        # Optimized matching with pre-calculated tolerance levels
+        match_results = []
+        for known_enc in known_encs:
+            best_match = False
+            
+            tolerance_levels = (
+                [tolerance * 0.5, tolerance * 0.7, tolerance * 0.9] 
+                if strict_matching else 
+                [tolerance * 0.6, tolerance * 0.8, tolerance]
+            )
+            
+            for enc in encodings:
+                for tol_level in tolerance_levels:
+                    if face_recognition.compare_faces([known_enc], enc, tolerance=tol_level)[0]:
+                        best_match = True
+                        break
+                if best_match:
+                    break
+            
+            match_results.append(best_match)
+        
+        return (str(img_path), True, match_results, None)
+        
+    except Exception as e:
+        return (str(img_path), False, [False] * len(known_encs), str(e))
 
 def collect_images(src: Path, recursive: bool) -> List[Path]:
     paths: List[Path] = []
@@ -244,6 +410,23 @@ def detect_existing_series(images: List[Path], prefix: str) -> Dict[str, int]:
     
     return existing_series
 
+def filter_already_renamed_images(images: List[Path], prefix: str) -> Tuple[List[Path], int]:
+    """
+    Filter out images that are already part of a series and return only new images.
+    Returns (new_images, count_of_filtered_images)
+    """
+    series_pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)_(\d+)")
+    new_images = []
+    filtered_count = 0
+    
+    for img in images:
+        if series_pattern.match(img.stem):
+            filtered_count += 1
+        else:
+            new_images.append(img)
+    
+    return new_images, filtered_count
+
 def get_next_series_number(existing_series: Dict[str, int], prefix: str) -> int:
     """
     Get the next series number based on existing series.
@@ -253,6 +436,7 @@ def get_next_series_number(existing_series: Dict[str, int], prefix: str) -> int:
 def _rename_series_groups(groups: List[List[Path]], prefix: str, continue_series: bool = True) -> None:
     """
     Rename series groups with optional continuation of existing numbering.
+    Includes Esc key termination support.
     """
     total_images = sum(len(g) for g in groups)
     if total_images == 0:
@@ -265,61 +449,89 @@ def _rename_series_groups(groups: List[List[Path]], prefix: str, continue_series
     
     use_tqdm = "tqdm" in globals() and tqdm is not None
     
-    with tqdm(total=total_images, desc="Renaming series", unit="img", 
-               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as bar:
-        for group_idx, group in enumerate(groups, 1):
-            group_sorted = sorted(group, key=lambda p: p.stat().st_mtime)
-            series_label = sanitize_filename(f"{prefix}_{series_index:03d}")
-            count = 1
-            
-            # Update progress bar description with current series info
-            bar.set_description(f"Series {series_index:03d} ({len(group)} imgs)")
-            
-            for img in group_sorted:
-                ext = img.suffix.lower()
-                new_base = f"{series_label}_{count:03d}{ext}"
-                dest_dir = img.parent
-                dest_path = unique_dest(dest_dir, new_base)
+    # Start escape key monitoring thread
+    monitor_thread = threading.Thread(target=monitor_escape_key, daemon=True)
+    monitor_thread.start()
+    
+    try:
+        with tqdm(total=total_images, desc="Renaming series", unit="img", dynamic_ncols=True, mininterval=0.1,
+                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}') as bar:
+            for group_idx, group in enumerate(groups, 1):
+                # Check for termination before processing each group
+                if TERMINATION_FLAG.is_set():
+                    print("\n[INFO] Terminating series renaming...")
+                    break
+                    
+                group_sorted = sorted(group, key=lambda p: p.stat().st_mtime)
+                series_label = sanitize_filename(f"{prefix}_{series_index:03d}")
+                count = 1
                 
-                try:
-                    os.replace(img, dest_path)
-                except Exception:
-                    with img.open("rb") as rf, open(dest_path, "xb") as wf:
-                        shutil.copyfileobj(rf, wf, length=1024 * 1024)
-                    img.unlink(missing_ok=False)
+                # Update progress bar description with current series info
+                bar.set_description(f"Series {series_index:03d} ({len(group)} imgs)")
                 
-                count += 1
-                bar.update(1)
+                for img in group_sorted:
+                    # Check for termination before processing each image
+                    if TERMINATION_FLAG.is_set():
+                        print("\n[INFO] Terminating series renaming...")
+                        break
+                        
+                    ext = img.suffix.lower()
+                    new_base = f"{series_label}_{count:03d}{ext}"
+                    dest_dir = img.parent
+                    dest_path = unique_dest(dest_dir, new_base)
+                    
+                    try:
+                        os.replace(img, dest_path)
+                    except Exception:
+                        with img.open("rb") as rf, open(dest_path, "xb") as wf:
+                            shutil.copyfileobj(rf, wf, length=1024 * 1024)
+                        img.unlink(missing_ok=False)
+                    
+                    count += 1
+                    bar.update(1)
+                    
+                    # Update postfix with current progress
+                    bar.set_postfix({
+                        'series': f"{series_index}/{len(groups)}",
+                        'in_series': f"{count-1}/{len(group)}",
+                        'renamed': bar.n
+                    })
                 
-                # Update postfix with current progress
-                bar.set_postfix({
-                    'series': f"{series_index}/{len(groups)}",
-                    'in_series': f"{count-1}/{len(group)}"
-                })
-            
-            series_index += 1
+                # Check for termination after each group
+                if TERMINATION_FLAG.is_set():
+                    break
+                    
+                series_index += 1
+                
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by user")
+    finally:
+        # Ensure termination flag is set for cleanup
+        TERMINATION_FLAG.set()
+        
+    # Exit cleanly if terminated early
+    if TERMINATION_FLAG.is_set() and bar.n < total_images:
+        print(f" Status: Terminated early (renamed {bar.n} of {total_images} images)")
+        sys.exit(0)
 
 # -------------------------
 # Worker (parallel)
 # -------------------------
 
-def _analyze_image_worker(img_path_str: str, tolerance: float, known_encs: List, jitter: int) -> tuple:
-    try:
-        if face_recognition is None:
-            raise RuntimeError("face_recognition dependency is not available")
+def _analyze_image_worker(img_path_str: str, tolerance: float, known_encs: List, jitter: int,
+                          min_face_size: float, max_face_size: float, face_model: str, strict_matching: bool) -> tuple:
+    """
+    Worker function for parallel face analysis using enhanced detection.
+    Checks for termination flag to allow graceful shutdown.
+    """
+    # Check for termination at start of worker
+    if TERMINATION_FLAG.is_set():
         img_path = Path(img_path_str)
-        validate_image(img_path)
-        img = face_recognition.load_image_file(str(img_path))
-        encs = face_recognition.face_encodings(img, num_jitters=max(1, int(jitter)))
-        if not encs:
-            return (img_path_str, False, [False] * len(known_encs), None)
-        match_bools = []
-        for known in known_encs:
-            ok = any(face_recognition.compare_faces([known], e, tolerance=tolerance)[0] for e in encs)
-            match_bools.append(ok)
-        return (img_path_str, True, match_bools, None)
-    except Exception as e:
-        return (img_path_str, False, [False] * len(known_encs), str(e))
+        return (str(img_path), False, [False] * len(known_encs), "Terminated by user")
+        
+    img_path = Path(img_path_str)
+    return analyze_faces_enhanced(img_path, tolerance, known_encs, jitter, 
+                                 min_face_size, max_face_size, face_model, strict_matching)
 
 # -------------------------
 # CLI + Interactive prompts
@@ -332,6 +544,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--src", type=Path, help="Source images folder")
     ap.add_argument("--recursive", action="store_true", help="Recurse into subfolders")
     ap.add_argument("--tolerance", type=float, help="Face match tolerance (0.2-0.8 typical)")
+    ap.add_argument("--min-face-size", type=float, default=0.08, help="Minimum face size as fraction of image (0.05-0.2)")
+    ap.add_argument("--max-face-size", type=float, default=0.9, help="Maximum face size as fraction of image (0.5-1.0)")
+    ap.add_argument("--face-model", choices=["hog", "cnn"], default="hog", help="Face detection model (hog=fast, cnn=accurate)")
+    ap.add_argument("--strict-matching", action="store_true", help="Use stricter face matching for better precision")
     ap.add_argument("--workers", type=int, help="Parallel workers")
     ap.add_argument("--jitter", type=int, help="Jitter samples for encodings (>=1)")
     ap.add_argument("--face", action="append", type=Path, help="Reference face image (repeatable)")
@@ -412,6 +628,16 @@ def interactive_fill(args: argparse.Namespace) -> argparse.Namespace:
         args.recursive = prompt_bool("Recurse subfolders?", False)
     if args.tolerance is None:
         args.tolerance = prompt_float("Tolerance (0.2-0.8 typical)", 0.5, 0.05, 1.0)
+    if args.min_face_size is None:
+        args.min_face_size = prompt_float("Minimum face size (0.05-0.2)", 0.08, 0.05, 0.2)
+    if args.max_face_size is None:
+        args.max_face_size = prompt_float("Maximum face size (0.5-1.0)", 0.9, 0.5, 1.0)
+    if args.face_model is None:
+        model_choice = input("Face detection model [hog/cnn] (default: hog): ").strip().lower()
+        args.face_model = model_choice if model_choice in ["cnn", "hog"] else "hog"
+    if not args.strict_matching:
+        args.strict_matching = prompt_bool("Use strict face matching?", False)
+    
     cpu = os.cpu_count() or 1
     max_w = cpu * CPU_MAX_FACTOR
     if args.workers is None:
@@ -469,9 +695,20 @@ def run_series_mode(args: argparse.Namespace) -> None:
         print("No images found.")
         return
     
-    # Check for existing series before processing
+    # Check for existing series before processing (use all images for detection)
     existing_series = detect_existing_series(images, args.series_prefix)
     continue_series = not args.no_continue_series
+    
+    # Filter out already renamed images for processing
+    images, filtered_count = filter_already_renamed_images(images, args.series_prefix)
+    new_total = len(images)
+    
+    if filtered_count > 0:
+        print(f"[INFO] Skipped {filtered_count} already renamed images")
+    
+    if new_total == 0:
+        print("No new images to process (all are already in series).")
+        return
     
     if existing_series and continue_series:
         max_series = max(existing_series.values())
@@ -505,18 +742,19 @@ def run_series_mode(args: argparse.Namespace) -> None:
         print("No groups formed.")
         return
     
-    print(f"[INFO] Grouped {total} images into {len(groups)} series")
+    print(f"[INFO] Grouped {new_total} new images into {len(groups)} series")
     for idx, g in enumerate(groups, 1):
         print(f" Series {idx:03d}: {len(g)} images")
     
     # Confirm before renaming if there are existing series
     if existing_series and continue_series:
-        confirm = input(f"\nContinue renaming {total} images? [y/N]: ").strip().lower()
+        confirm = input(f"\nContinue renaming {new_total} new images? [y/N]: ").strip().lower()
         if confirm not in ("y", "yes"):
             print("Operation cancelled.")
             return
     
     # Rename with series continuation
+    print("[INFO] Press ESC key to terminate renaming gracefully")
     try:
         _rename_series_groups(groups, args.series_prefix, continue_series)
         print("Series grouping and renaming completed.")
@@ -556,44 +794,53 @@ def main():
     total_moved = 0
 
     print(f"[INFO] Processing {total} images from {args.src}")
+    print("[INFO] Press ESC key to terminate processing gracefully\n")
+    
+    # Start escape key monitoring thread
+    monitor_thread = threading.Thread(target=monitor_escape_key, daemon=True)
+    monitor_thread.start()
 
     try:
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            futures = [ex.submit(_analyze_image_worker, str(p), args.tolerance, known_encs, args.jitter) for p in images]
-            with tqdm(total=total, desc="Processing images", unit="img", 
-                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+            futures = [ex.submit(_analyze_image_worker, str(p), args.tolerance, known_encs, args.jitter,
+                               args.min_face_size, args.max_face_size, args.face_model, args.strict_matching) 
+                      for p in images]
+            with tqdm(total=total, desc="Processing images", unit="img", dynamic_ncols=True, mininterval=0.1,
+                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}') as pbar:
+                pbar.set_postfix({'moved': 0, 'unmatched': 0, 'errors': 0}, refresh=False)
+                
                 for fut in as_completed(futures):
+                    # Check for termination before processing result
+                    if TERMINATION_FLAG.is_set():
+                        print("\n[INFO] Terminating processing...")
+                        # Cancel remaining futures
+                        for remaining_fut in futures:
+                            if not remaining_fut.done():
+                                remaining_fut.cancel()
+                        break
+                        
                     img_path_str, has_faces, match_bools, err = fut.result()
                     img_path = Path(img_path_str)
+                    processed = pbar.n  # Get current processed count
 
                     if err:
                         errors += 1
-                        pbar.set_postfix({
-                            'moved': total_moved,
-                            'unmatched': unmatched,
-                            'errors': errors
-                        })
+                        if "Terminated by user" in str(err):
+                            break
+                        pbar.set_postfix({'moved': total_moved, 'unmatched': unmatched, 'errors': errors}, refresh=False)
                         pbar.update(1)
                         continue
                         
                     if not has_faces:
                         unmatched += 1
-                        pbar.set_postfix({
-                            'moved': total_moved,
-                            'unmatched': unmatched,
-                            'errors': errors
-                        })
+                        pbar.set_postfix({'moved': total_moved, 'unmatched': unmatched, 'errors': errors}, refresh=False)
                         pbar.update(1)
                         continue
                         
                     matches = [i for i, ok in enumerate(match_bools) if ok]
                     if not matches:
                         unmatched += 1
-                        pbar.set_postfix({
-                            'moved': total_moved,
-                            'unmatched': unmatched,
-                            'errors': errors
-                        })
+                        pbar.set_postfix({'moved': total_moved, 'unmatched': unmatched, 'errors': errors}, refresh=False)
                         pbar.update(1)
                         continue
                         
@@ -605,26 +852,44 @@ def main():
                     except Exception:
                         errors += 1
                     
-                    # Update progress bar postfix with detailed stats
-                    per_dest_str = ", ".join([f"{Path(d).name}:{moved_to[str(d)]}" for d in dest_dirs if moved_to[str(d)] > 0])
-                    pbar.set_postfix({
-                        'moved': total_moved,
-                        'unmatched': unmatched,
-                        'errors': errors,
-                        'destinations': per_dest_str if per_dest_str else 'none'
-                    })
+                    # Update progress bar with optimized postfix
+                    pbar.set_postfix({'moved': total_moved, 'unmatched': unmatched, 'errors': errors}, refresh=False)
                     pbar.update(1)
+                    
+                    # Check for termination after each update
+                    if TERMINATION_FLAG.is_set():
+                        print("\n[INFO] Terminating processing...")
+                        # Cancel remaining futures
+                        for remaining_fut in futures:
+                            if not remaining_fut.done():
+                                remaining_fut.cancel()
+                        break
 
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user")
+    except Exception as e:
+        print(f"\n[ERROR] Processing failed: {e}")
+        
+    # Ensure termination flag is set for cleanup
+    TERMINATION_FLAG.set()
+    
+    # Calculate final processed count
+    processed_count = total_moved + unmatched + errors
 
     print("\n[SUMMARY]")
+    print(f" Processed: {processed_count}/{total} images")
     for d in dest_dirs:
         print(f" {d}: {moved_to[str(d)]} moved")
     print(f" Total moved: {total_moved}")
     print(f" Unmatched/no-face: {unmatched}")
     if errors:
         print(f" Errors: {errors}")
+    if TERMINATION_FLAG.is_set() and processed_count < total:
+        print(f" Status: Terminated early (processed {processed_count} of {total} images)")
+        
+    # Exit cleanly if terminated early
+    if TERMINATION_FLAG.is_set() and processed_count < total:
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()

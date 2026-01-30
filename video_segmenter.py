@@ -24,6 +24,23 @@ import shutil
 
 from tqdm import tqdm
 
+# Import shared utilities
+try:
+    from src.scripts.common_utils import format_size
+    _HAS_COMMON_UTILS = True
+except ImportError:
+    _HAS_COMMON_UTILS = False
+    def format_size(size_bytes: int) -> str:
+        if size_bytes == 0:
+            return "0B"
+        size_names = ("B", "KB", "MB", "GB", "TB")
+        i = 0
+        size = float(size_bytes)
+        while size >= 1024.0 and i < len(size_names) - 1:
+            size /= 1024.0
+            i += 1
+        return f"{size:.1f}{size_names[i]}"
+
 try:
     import imageio_ffmpeg
 except ImportError as e:
@@ -171,13 +188,24 @@ class VideoSegmenter:
             return False
         return True
 
-    def update_progress(self, segment_idx: int):
-        """Update progress bar."""
+    def update_progress(self, segment_idx: int, total_segments: int):
+        """Update progress bar with enhanced metrics."""
         with self.progress_lock:
-            if self.progress_bar and len(self.segments) > 0:
-                progress = min(100, int(((segment_idx + 1) / len(self.segments)) * 100))
+            if self.progress_bar and total_segments > 0:
+                progress = min(100, int(((segment_idx + 1) / total_segments) * 100))
                 self.progress_bar.n = progress
-                self.progress_bar.set_postfix_str(f"seg={segment_idx+1}/{len(self.segments)}")
+                
+                # Enhanced postfix with detailed metrics
+                elapsed = time.time() - self._start_time if self._start_time else 0
+                rate = (segment_idx + 1) / elapsed if elapsed > 0 else 0
+                eta = (total_segments - segment_idx - 1) / rate if rate > 0 else 0
+                
+                postfix_dict = {
+                    'seg': f"{segment_idx+1}/{total_segments}",
+                    'eta': f"{eta:.0f}s"
+                }
+                
+                self.progress_bar.set_postfix(postfix_dict, refresh=False)
                 self.progress_bar.refresh()
 
     def analyze_video(self) -> bool:
@@ -220,7 +248,7 @@ class VideoSegmenter:
             return False
 
     def segment_video(self, segment_idx: int, start: float, end: float) -> bool:
-        """Create a video segment from start to end time."""
+        """Create a video segment from start to end time with enhanced error handling."""
         if _termination.is_terminating():
             return False
 
@@ -232,15 +260,16 @@ class VideoSegmenter:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             duration = max(0.0, end - start)
             
-            # Use stream copy for fast segmentation without re-encoding
+            # Optimized FFmpeg command with better error handling
             cmd = [
                 ffmpeg_exe,
-                "-y",
-                "-ss", str(start),
-                "-t", str(duration),
-                "-i", str(self.input_path),
+                "-y",  # Overwrite output file
+                "-ss", str(start),  # Start time
+                "-t", str(duration),  # Duration
+                "-i", str(self.input_path),  # Input file
                 "-c", "copy",  # Copy streams without re-encoding
                 "-an",  # No audio
+                "-avoid_negative_ts", "make_zero",  # Better timestamp handling
                 str(output_path),
             ]
             
@@ -253,10 +282,28 @@ class VideoSegmenter:
                 text=False,
             )
 
-            # Monitor ffmpeg execution
+            # Enhanced process monitoring with timeout
+            timeout_duration = max(300, duration * 10)  # Minimum 5 minutes or 10x duration
+            start_time = time.time()
+            
             while True:
                 if process.poll() is not None:
                     break
+                
+                # Check for timeout
+                if time.time() - start_time > timeout_duration:
+                    logger.warning(f"Segment {segment_idx+1} timed out after {timeout_duration}s")
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    if output_path.exists():
+                        try:
+                            output_path.unlink()
+                        except OSError:
+                            pass
+                    return False
                 
                 if _termination.is_terminating():
                     logger.info(f"Segment {segment_idx+1} creation aborted by user.")
@@ -288,10 +335,19 @@ class VideoSegmenter:
                         pass
                 return False
 
+            # Verify output file
             if not _termination.is_terminating():
-                logger.info(f"Created segment {segment_idx+1}: {output_filename}")
-                self.update_progress(segment_idx)
-                return True
+                if output_path.exists() and output_path.stat().st_size > 1024:  # At least 1KB
+                    logger.info(f"Created segment {segment_idx+1}: {output_filename}")
+                    return True
+                else:
+                    logger.error(f"Output file invalid or empty: {output_path}")
+                    if output_path.exists():
+                        try:
+                            output_path.unlink()
+                        except OSError:
+                            pass
+                    return False
             else:
                 if output_path.exists():
                     try:
@@ -321,18 +377,21 @@ class VideoSegmenter:
         pass  # Memory management not critical for stream-copy segmentation
 
     def run(self):
-        """Main segmentation workflow."""
+        """Main segmentation workflow with optimized progress tracking."""
         start_esc_listener()
         self._start_time = time.time()
 
         if not self.validate_input():
             return
 
+        # Optimized progress bar initialization
         self.progress_bar = tqdm(
             total=100,
             desc="Segmenting",
             unit="%",
-            bar_format='{desc}: {percentage:3.0f}% |{bar}| [{postfix}]'
+            bar_format='{desc}: {percentage:3.0f}% |{bar}| [{elapsed}<{remaining}] {postfix}',
+            dynamic_ncols=True,
+            mininterval=0.15
         )
 
         if not self.analyze_video():
@@ -344,11 +403,15 @@ class VideoSegmenter:
             self.progress_bar.close()
             return
 
+        total_segments = len(self.segments)
         logger.info(
-            f"Starting segmentation of {len(self.segments)} segments "
+            f"Starting segmentation of {total_segments} segments "
             f"with {self.max_workers} workers"
         )
 
+        successful_segments = 0
+        failed_segments = 0
+        
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {}
             for i, (start, end) in enumerate(self.segments):
@@ -364,7 +427,10 @@ class VideoSegmenter:
                 
                 try:
                     success = future.result()
-                    if not success:
+                    if success:
+                        successful_segments += 1
+                    else:
+                        failed_segments += 1
                         i, start, end = futures[future]
                         logger.warning(f"Segment {i+1} failed. Retrying (max {self.max_retries} times)...")
                         
@@ -377,14 +443,21 @@ class VideoSegmenter:
                             logger.info(f"Retrying segment {i+1}...")
                             ok = self.segment_video(i, start, end)
                             if ok:
+                                successful_segments += 1
                                 logger.info(f"Segment {i+1} succeeded on retry {retries+1}")
                                 break
                             retries += 1
                         
                         if retries >= self.max_retries:
                             logger.error(f"Segment {i+1} failed after {self.max_retries} retries. Skipping.")
+                    
+                    # Update progress with enhanced metrics
+                    processed_segments = successful_segments + failed_segments
+                    self.update_progress(processed_segments - 1, total_segments)
+                    
                 except Exception as e:
                     logger.error(f"Exception in segmentation: {e}")
+                    failed_segments += 1
 
         if _termination.is_terminating():
             logger.info("Segmentation terminated by user.")
@@ -395,9 +468,14 @@ class VideoSegmenter:
 
         self.progress_bar.close()
         
+        # Enhanced final summary
         elapsed = time.time() - self._start_time if self._start_time else 0.0
         if elapsed > 0:
+            avg_rate = successful_segments / elapsed
             logger.info(f"Total time: {elapsed:.2f}s")
+            logger.info(f"Successful segments: {successful_segments}/{total_segments}")
+            logger.info(f"Failed segments: {failed_segments}/{total_segments}")
+            logger.info(f"Average rate: {avg_rate:.2f} segments/sec")
 
 
 def main():

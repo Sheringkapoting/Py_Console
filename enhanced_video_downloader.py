@@ -100,13 +100,14 @@ class EnhancedVideoDownloader:
     def _setup_enhanced_session(self):
         """Setup enhanced session with advanced bypass techniques."""
         # Mobile-friendly headers for Android compatibility
-        if self.android_mode:
-            user_agent = 'Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
-        else:
-            user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            
+        user_agent = (
+            'Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
+            if self.android_mode else
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        
         # Comprehensive headers to mimic real browser behavior
-        self.session.headers.update({
+        headers = {
             'User-Agent': user_agent,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
@@ -119,9 +120,11 @@ class EnhancedVideoDownloader:
             'Sec-Fetch-Site': 'none',
             'Sec-Fetch-User': '?1',
             'Cache-Control': 'max-age=0'
-        })
+        }
         
-        # Setup retry strategy
+        self.session.headers.update(headers)
+        
+        # Setup retry strategy with adapter
         retry_strategy = Retry(
             total=3,
             backoff_factor=1,
@@ -264,27 +267,30 @@ class EnhancedVideoDownloader:
             self.logger.debug(f"Direct fetch failed: {e}")
             return None
         
+    def _fetch_with_headers(self, url: str, headers: dict) -> Optional[str]:
+        """Generic fetch method with custom headers."""
+        try:
+            response = self.session.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            # Ensure proper encoding
+            if response.encoding is None:
+                response.encoding = 'utf-8'
+            return response.text
+        except Exception as e:
+            self.logger.debug(f"Fetch with custom headers failed: {e}")
+            return None
+        
     def _fetch_with_referrer(self, url: str) -> Optional[str]:
         """Fetch with referrer header to bypass some restrictions."""
         headers = {'Referer': f"{urlparse(url).scheme}://{urlparse(url).netloc}"}
-        response = self.session.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        # Ensure proper encoding
-        if response.encoding is None:
-            response.encoding = 'utf-8'
-        return response.text
+        return self._fetch_with_headers(url, headers)
         
     def _fetch_with_mobile_agent(self, url: str) -> Optional[str]:
         """Fetch with mobile user agent."""
         headers = {
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1'
         }
-        response = self.session.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        # Ensure proper encoding
-        if response.encoding is None:
-            response.encoding = 'utf-8'
-        return response.text
+        return self._fetch_with_headers(url, headers)
         
     def _fetch_with_proxy_headers(self, url: str) -> Optional[str]:
         """Fetch with proxy-like headers."""
@@ -293,12 +299,7 @@ class EnhancedVideoDownloader:
             'X-Real-IP': '8.8.8.8',
             'Via': '1.1 proxy'
         }
-        response = self.session.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        # Ensure proper encoding
-        if response.encoding is None:
-            response.encoding = 'utf-8'
-        return response.text
+        return self._fetch_with_headers(url, headers)
         
     def extract_videos_enhanced(self, url: str) -> List[Dict[str, str]]:
         """Enhanced video extraction with multiple detection methods."""

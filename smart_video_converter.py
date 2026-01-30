@@ -449,7 +449,7 @@ class VideoToGifConverter:
         
         self.logger.info(f"Optimizing GIF size: {original_size:.1f}MB -> {target_size_mb}MB target")
         
-        # Create backup
+        # Create backup with error handling
         backup_path = gif_path.with_suffix('.gif.backup')
         try:
             import shutil
@@ -459,20 +459,22 @@ class VideoToGifConverter:
             return False
         
         try:
-            # Strategy 1: Quality reduction with frame optimization
-            if self._optimize_by_quality(gif_path, target_size_bytes, quality):
-                backup_path.unlink(missing_ok=True)
-                return True
+            # Optimized strategy execution with early termination
+            strategies = [
+                ("Quality", lambda: self._optimize_by_quality(gif_path, target_size_bytes, quality)),
+                ("Frame reduction", lambda: self._optimize_by_frame_reduction(gif_path, backup_path, target_size_bytes)),
+                ("Palette reduction", lambda: self._optimize_by_palette_reduction(gif_path, backup_path, target_size_bytes))
+            ]
             
-            # Strategy 2: Frame reduction if quality optimization failed
-            if self._optimize_by_frame_reduction(gif_path, backup_path, target_size_bytes):
-                backup_path.unlink(missing_ok=True)
-                return True
-            
-            # Strategy 3: Color palette reduction
-            if self._optimize_by_palette_reduction(gif_path, backup_path, target_size_bytes):
-                backup_path.unlink(missing_ok=True)
-                return True
+            for strategy_name, strategy_func in strategies:
+                if _termination.is_terminating():
+                    self.logger.info(f"Optimization terminated by user during {strategy_name} strategy")
+                    break
+                    
+                self.logger.debug(f"Trying {strategy_name} strategy...")
+                if strategy_func():
+                    backup_path.unlink(missing_ok=True)
+                    return True
             
             # If all strategies failed, restore backup
             self.logger.warning(f"Could not optimize to target size with any strategy. Restoring original.")
@@ -492,7 +494,7 @@ class VideoToGifConverter:
             return False
     
     def _optimize_by_quality(self, gif_path: Path, target_size_bytes: int, start_quality: int) -> bool:
-        """Optimize GIF by reducing quality iteratively."""
+        """Optimize GIF by reducing quality iteratively with memory efficiency."""
         try:
             with Image.open(gif_path) as img:
                 # Extract frames more efficiently
@@ -502,12 +504,11 @@ class VideoToGifConverter:
                 
                 frames, durations = frames_data
                 
-                # Iterative quality reduction
+                # Iterative quality reduction with optimized temp file handling
+                temp_path = gif_path.with_suffix('.tmp.gif')
                 for quality in range(start_quality, 19, -10):
                     try:
-                        # Use temporary file to avoid corrupting original during optimization
-                        temp_path = gif_path.with_suffix('.tmp.gif')
-                        
+                        # Save with optimized parameters
                         frames[0].save(
                             temp_path,
                             save_all=True,
@@ -526,12 +527,12 @@ class VideoToGifConverter:
                             self.logger.info(f"Quality optimization successful: {current_size_mb:.1f}MB (quality: {quality})")
                             return True
                         
-                        # Clean up temp file
-                        temp_path.unlink(missing_ok=True)
-                        
                     except Exception as e:
                         self.logger.debug(f"Quality {quality} failed: {e}")
                         continue
+                
+                # Clean up temp file after all attempts
+                temp_path.unlink(missing_ok=True)
                 
                 return False
                 
@@ -555,16 +556,15 @@ class VideoToGifConverter:
                 original_frame_count = len(frames)
                 
                 # Try reducing frames by 2x, 3x, 4x
+                temp_path = gif_path.with_suffix('.tmp.gif')
                 for reduction_factor in [2, 3, 4]:
                     try:
                         # Keep every nth frame
                         reduced_frames = frames[::reduction_factor]
-                        reduced_durations = [d * reduction_factor for d in durations[::reduction_factor]]
-                        
                         if len(reduced_frames) < 2:  # Need at least 2 frames for animation
                             continue
                         
-                        temp_path = gif_path.with_suffix('.tmp.gif')
+                        reduced_durations = [d * reduction_factor for d in durations[::reduction_factor]]
                         
                         reduced_frames[0].save(
                             temp_path,
@@ -582,11 +582,12 @@ class VideoToGifConverter:
                             self.logger.info(f"Frame reduction successful: {current_size_mb:.1f}MB ({len(reduced_frames)}/{original_frame_count} frames)")
                             return True
                         
-                        temp_path.unlink(missing_ok=True)
-                        
                     except Exception as e:
                         self.logger.debug(f"Frame reduction {reduction_factor}x failed: {e}")
                         continue
+                
+                # Clean up temp file after all attempts
+                temp_path.unlink(missing_ok=True)
                 
                 return False
                 
@@ -609,18 +610,15 @@ class VideoToGifConverter:
                 frames, durations = frames_data
                 
                 # Try different palette sizes
+                temp_path = gif_path.with_suffix('.tmp.gif')
                 for colors in [128, 64, 32, 16]:
                     try:
                         # Convert frames to reduced palette
-                        reduced_frames = []
-                        for frame in frames:
-                            # Convert to P mode with reduced palette
-                            if frame.mode != 'P':
-                                frame = frame.convert('RGB')
-                            reduced_frame = frame.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
-                            reduced_frames.append(reduced_frame)
-                        
-                        temp_path = gif_path.with_suffix('.tmp.gif')
+                        reduced_frames = [
+                            frame.convert('RGB').quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+                            if frame.mode != 'P' else frame.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+                            for frame in frames
+                        ]
                         
                         reduced_frames[0].save(
                             temp_path,
@@ -637,11 +635,12 @@ class VideoToGifConverter:
                             self.logger.info(f"Palette reduction successful: {current_size_mb:.1f}MB ({colors} colors)")
                             return True
                         
-                        temp_path.unlink(missing_ok=True)
-                        
                     except Exception as e:
                         self.logger.debug(f"Palette reduction to {colors} colors failed: {e}")
                         continue
+                
+                # Clean up temp file after all attempts
+                temp_path.unlink(missing_ok=True)
                 
                 return False
                 
@@ -655,13 +654,17 @@ class VideoToGifConverter:
             frames = []
             durations = []
             
-            for frame_num in range(img.n_frames):
+            # Extract frames efficiently
+            frame_count = img.n_frames
+            if frame_count <= 0:
+                return None
+            
+            frames = []
+            durations = []
+            
+            for frame_num in range(frame_count):
                 img.seek(frame_num)
-                # Create a copy to avoid issues with frame references
-                frame = img.copy()
-                frames.append(frame)
-                
-                # Get frame duration (default to 100ms if not available)
+                frames.append(img.copy())
                 duration = img.info.get('duration', 100)
                 durations.append(max(duration, 20))  # Minimum 20ms per frame
             
@@ -1075,7 +1078,7 @@ class VideoToGifConverter:
         if tqdm and progress_style != 'none':
             # Unified, simple progress bar for batch processing
             bar_desc = "Batch Converting" if progress_style == 'simple' else "Batch Converting (verbose)"
-            with tqdm(total=total_files, desc=bar_desc, unit="files") as batch_pbar:
+            with tqdm(total=total_files, desc=bar_desc, unit="files", dynamic_ncols=True, mininterval=0.15) as batch_pbar:
                 for i, video_path in enumerate(video_files, 1):
                     # Update progress bar description with current file info
                     filename = video_path.name
@@ -1202,7 +1205,7 @@ class VideoToGifConverter:
         
         if tqdm and progress_style != 'none':
             desc = "Concurrent Converting" if progress_style == 'simple' else f"Concurrent Converting ({max_workers} workers)"
-            with tqdm(total=total_files, desc=desc, unit="files") as pbar:
+            with tqdm(total=total_files, desc=desc, unit="files", dynamic_ncols=True, mininterval=0.15) as pbar:
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     future_to_index = { executor.submit(convert_single_file, (i, video_path)): i for i, video_path in enumerate(video_files) }
                     for future in as_completed(future_to_index):
