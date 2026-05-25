@@ -53,22 +53,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# ── ESC-key abort (Windows msvcrt; silently skipped elsewhere) ───────────────
-_stop_event = threading.Event()
-
-def _esc_listener() -> None:
-    """Background thread: poll for ESC key (byte 0x1B) and signal abort."""
-    try:
-        import msvcrt
-        while not _stop_event.is_set():
-            if msvcrt.kbhit():
-                ch = msvcrt.getch()
-                if ch == b'\x1b':      # ESC
-                    _stop_event.set()
-                    break
-            time.sleep(0.05)
-    except Exception:
-        pass   # non-Windows or msvcrt unavailable — ESC abort not supported
+# ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
+import sys as _sys_tmp
+_scripts_dir = str(Path(__file__).parent / "src" / "scripts")
+if _scripts_dir not in _sys_tmp.path:
+    _sys_tmp.path.insert(0, _scripts_dir)
+from common_utils import TerminationManager as _TerminationManager
+del _sys_tmp, _scripts_dir
+_tm = _TerminationManager()
+_tm.start_monitoring()
 
 # ── Cap ONNX/OpenMP threads BEFORE onnxruntime / torch are imported ──────────
 _OMP_THREADS = 4

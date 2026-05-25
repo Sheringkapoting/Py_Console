@@ -8,7 +8,11 @@ subfolders using InsightFace's buffalo_l models (SCRFD + ArcFace).
 All folder paths are asked interactively at runtime — no code edits needed.
 
 Requirements (install once):
-    pip install insightface onnxruntime opencv-python pillow tqdm rich
+    # Standard (CPU only):
+    pip install insightface onnxruntime opencv-python pillow tqdm rich psutil
+    # Recommended for Samsung Galaxy Book 5 / Intel Arc GPU (DirectML):
+    pip uninstall onnxruntime -y
+    pip install insightface onnxruntime-directml opencv-python pillow tqdm rich psutil
 
 Usage:
     python face_sorter.py                          # fully interactive
@@ -23,9 +27,31 @@ from __future__ import annotations
 # ── DEFAULTS  (overridden by CLI args or interactive prompts) ─────────────────
 _DEFAULT_MODELS_ROOT = r"C:\Users\Sunil\Downloads\Quick Share"
 _DEFAULT_THRESHOLD   = 0.40
-_DEFAULT_MIN_DET     = 0.50
+_DEFAULT_MIN_DET     = 0.65   # raised from 0.50 — rejects blurry/distant/background faces
 _IMAGE_EXTS          = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+_MAX_SIDE            = 1280   # pre-resize: cap longer edge before inference
+_OMP_THREADS         = 4      # ONNX CPU thread cap (change to os.cpu_count()//2 if desired)
+
+# ── Group-detection face quality gates ───────────────────────────────────────
+# Only "significant" secondary faces trigger Group.  Filters out background
+# crowds, distant faces, bokeh blur, and edge-of-frame partial faces.
+_MIN_FACE_IMG_RATIO   = 0.005  # face bbox area must be ≥ 0.5% of image area
+_MIN_SECONDARY_RATIO  = 0.18   # secondary face area must be ≥ 18% of largest face area
 # ─────────────────────────────────────────────────────────────────────────────
+
+import os
+# ── Cap ONNX/OpenMP threads BEFORE onnxruntime is imported ───────────────────
+os.environ.setdefault("OMP_NUM_THREADS",         str(_OMP_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS",         str(_OMP_THREADS))
+os.environ.setdefault("OPENBLAS_NUM_THREADS",    str(_OMP_THREADS))
+os.environ.setdefault("ONNXRUNTIME_THREAD_COUNT", str(_OMP_THREADS))
+
+# ── Lower process priority so PC stays responsive ────────────────────────────
+try:
+    import psutil
+    psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)   # Windows
+except Exception:
+    pass   # psutil absent or non-Windows: silently skip
 
 import argparse
 import base64
@@ -34,43 +60,21 @@ import json
 import re
 import shutil
 import sys
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
-# ── ESC key termination support ────────────────────────────────────────────────
-try:
-    import msvcrt
-    _HAS_MSVC = True
-except ImportError:
-    _HAS_MSVC = False
-
-class TerminationManager:
-    """Manages graceful termination on ESC key press."""
-    def __init__(self):
-        self._should_terminate = False
-    
-    def check_esc(self) -> bool:
-        """Check if ESC key was pressed (Windows only)."""
-        if not _HAS_MSVC:
-            return False
-        try:
-            if msvcrt.kbhit():
-                key = msvcrt.getch()
-                if key == b'\x1b':  # ESC key
-                    self._should_terminate = True
-                    return True
-        except Exception:
-            pass
-        return False
-    
-    @property
-    def should_terminate(self) -> bool:
-        return self._should_terminate
-
-# Global termination manager
-termination_manager = TerminationManager()
+# ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
+import sys as _sys_tmp
+_scripts_dir = str(Path(__file__).parent / "src" / "scripts")
+if _scripts_dir not in _sys_tmp.path:
+    _sys_tmp.path.insert(0, _scripts_dir)
+from common_utils import TerminationManager as _TerminationManager
+del _sys_tmp, _scripts_dir
+_tm = _TerminationManager()
+_tm.start_monitoring()
 
 
 # ── Dependency check ──────────────────────────────────────────────────────────
@@ -232,12 +236,46 @@ def interactive_setup(args: argparse.Namespace) -> argparse.Namespace:
 
 def load_face_app(models_root: str):
     from insightface.app import FaceAnalysis
+    import onnxruntime as ort
+
+    # Suppress noisy ONNX provider-load warnings (missing CUDA DLLs etc.)
+    ort.set_default_logger_severity(3)   # 0=Verbose … 3=Error … 4=Fatal
+
+    # Galaxy Book 5 has Intel Arc, no NVIDIA — skip CUDAExecutionProvider entirely.
+    # CUDAExecutionProvider listed by onnxruntime-directml even without NVIDIA GPU,
+    # causing "cublasLt64_12.dll missing" spam before falling back to CPU anyway.
+    available = ort.get_available_providers()
+    providers: list[str] = []
+    for ep in ("DmlExecutionProvider", "CPUExecutionProvider"):   # CUDA removed
+        if ep in available:
+            providers.append(ep)
+    if not providers:
+        providers = ["CPUExecutionProvider"]
+
+    ep_label = providers[0]
+    if ep_label == "CPUExecutionProvider":
+        console.print(
+            f"  [yellow]⚠ DirectML unavailable — running on CPU "
+            f"(threads capped={_OMP_THREADS})[/yellow]\n"
+            f"  [dim]  Fix: pip uninstall onnxruntime -y  &&  "
+            f"pip install onnxruntime-directml[/dim]"
+        )
+    else:
+        console.print(
+            f"  [green]✓[/green] [dim]ONNX provider: {ep_label}  "
+            f"(threads capped={_OMP_THREADS})[/dim]"
+        )
+
+    # genderage added so we can count female faces for Group detection.
+    # 2d106det.onnx and 1k3d68.onnx (landmarks) still skipped — not needed.
     app = FaceAnalysis(
-        name      = "buffalo_l",
-        root      = models_root,
-        providers = ["CPUExecutionProvider"],
+        name            = "buffalo_l",
+        root            = models_root,
+        providers       = providers,
+        allowed_modules = ["detection", "recognition", "genderage"],
     )
-    app.prepare(ctx_id=-1, det_size=(640, 640))
+    app.prepare(ctx_id=0 if providers[0] != "CPUExecutionProvider" else -1,
+                det_size=(640, 640))
     return app
 
 
@@ -304,31 +342,102 @@ def load_references(app, faces_folder: Path) -> dict[str, list[np.ndarray]]:
 
 # ── Per-image matcher ─────────────────────────────────────────────────────────
 
+def _resize_for_inference(img: np.ndarray, max_side: int = _MAX_SIDE) -> np.ndarray:
+    """Cap longer edge at max_side using INTER_AREA.  Reduces decode+inference cost
+    for high-res phone photos (4K+) without affecting ArcFace accuracy — the
+    recognition model crops faces to 112×112 regardless of input size."""
+    h, w = img.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return img
+    scale = max_side / longest
+    new_w, new_h = int(w * scale), int(h * scale)
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
 def match_image(
     img_path: Path,
     app,
     refs: dict[str, list[np.ndarray]],
     threshold: float,
     min_det: float = _DEFAULT_MIN_DET,
-) -> list[dict]:
-    """Detect faces in one image and return all matches above threshold."""
+    cache: dict | None = None,
+) -> tuple[list[dict], int]:
+    """Detect faces in one image.  Returns (matches, face_count).
+    face_count = number of valid faces detected (above min_det score).
+    If *cache* is provided, cached embeddings are reused and new ones stored."""
     img = cv2.imread(str(img_path))
     if img is None:
-        return []
+        return [], 0
+
+    # ── Check embedding cache before running inference ───────────────────
+    cached_emb, cached_face_count = (
+        _get_cached_embedding(cache, img_path) if cache is not None else (None, 0)
+    )
+    if cached_emb is not None:
+        best_person: Optional[str] = None
+        best_score = -1.0
+        for person, embeddings in refs.items():
+            score = max(cosine_sim(cached_emb, e) for e in embeddings)
+            if score > best_score:
+                best_score, best_person = score, person
+        if best_person and best_score >= threshold:
+            return [{
+                "person":     best_person,
+                "score":      round(best_score, 4),
+                "bbox":       [0, 0, 0, 0],
+                "img_path":   img_path,
+                "face_count": cached_face_count,
+            }], cached_face_count
+        return [], cached_face_count
+
+    # ── Full inference path ──────────────────────────────────────────────
+    img = _resize_for_inference(img)
+    h, w = img.shape[:2]
+    img_area = h * w
 
     faces = app.get(img)
     if not faces:
-        return []
+        return [], 0
 
-    confirmed: list[dict]   = []
-    seen_persons: set[str]  = set()
+    def _bbox_area(f) -> float:
+        return max(0.0, float((f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1])))
 
-    for face in faces:
-        if face.det_score < min_det:
-            continue
+    # ── Gate 1: det_score ≥ min_det (rejects blurry / low-confidence) ───
+    valid_faces = [f for f in faces if f.det_score >= min_det]
 
-        best_person: Optional[str] = None
-        best_score = -1.0
+    # ── Gate 2: absolute size — face bbox ≥ 0.5% of image area ─────────
+    # Eliminates tiny crowd/background faces regardless of det_score.
+    valid_faces = [f for f in valid_faces
+                   if _bbox_area(f) / img_area >= _MIN_FACE_IMG_RATIO]
+
+    if not valid_faces:
+        return [], 0
+
+    # ── Primary face = largest valid face ───────────────────────────────
+    primary_area = max(_bbox_area(f) for f in valid_faces)
+
+    # ── Gate 3: relative size — secondary faces ≥ 18% of primary area ──
+    # Eliminates background figures and distant faces when a clear
+    # primary subject is present.
+    significant_faces = [f for f in valid_faces
+                         if _bbox_area(f) >= primary_area * _MIN_SECONDARY_RATIO]
+
+    # ── Gender filter — only CONFIRMED female faces count toward Group ──
+    # Unknown sex (attr absent) is NOT defaulted to female — avoids
+    # counting distant/blurry faces whose gender model is uncertain.
+    def _is_confirmed_female(f) -> bool:
+        return getattr(f, "sex", None) == "F"
+
+    face_count = sum(1 for f in significant_faces if _is_confirmed_female(f))
+
+    confirmed: list[dict]  = []
+    seen_persons: set[str] = set()
+
+    # Run recognition only on significant faces (skip tiny background ones)
+    for face in significant_faces:
+        best_person = None
+        best_score  = -1.0
 
         for person, embeddings in refs.items():
             if person in seen_persons:
@@ -339,32 +448,83 @@ def match_image(
 
         if best_person and best_score >= threshold:
             confirmed.append({
-                "person":   best_person,
-                "score":    round(best_score, 4),
-                "bbox":     face.bbox.astype(int).tolist(),
-                "img_path": img_path,
+                "person":     best_person,
+                "score":      round(best_score, 4),
+                "bbox":       face.bbox.astype(int).tolist(),
+                "img_path":   img_path,
+                "face_count": face_count,
+                "is_female":  _is_confirmed_female(face),   # gender of THIS detected face
             })
             seen_persons.add(best_person)
 
-    return confirmed
+    # ── Cache: store largest CONFIRMED-FEMALE face embedding ────────────
+    female_sig = [f for f in significant_faces if _is_confirmed_female(f)]
+    cache_face = (
+        max(female_sig,    key=_bbox_area) if female_sig else
+        max(significant_faces, key=_bbox_area)
+    )
+    if cache is not None:
+        _set_cached_embedding(cache, img_path, cache_face.embedding, face_count)
+
+    return confirmed, face_count
+
+
+# ── Embedding cache ───────────────────────────────────────────────────────────
+# Stores {abs_path: {"mtime": float, "embedding": [float, ...]}}
+# Key = absolute path string.  Invalidated when file mtime changes.
+# Saves ~400-600 ms per cached image on repeat runs.
+
+def _load_cache(cache_path: Path) -> dict:
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_cache(cache: dict, cache_path: Path) -> None:
+    try:
+        cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    except Exception:
+        pass   # cache write failure is non-fatal
+
+
+def _get_cached_embedding(cache: dict, img_path: Path) -> tuple[Optional[np.ndarray], int]:
+    """Returns (embedding, face_count).  face_count=1 for old cache entries (backward compat)."""
+    key   = str(img_path.resolve())
+    entry = cache.get(key)
+    if entry and abs(entry["mtime"] - img_path.stat().st_mtime) < 1.0:
+        return np.array(entry["embedding"], dtype=np.float32), int(entry.get("face_count", 1))
+    return None, 0
+
+
+def _set_cached_embedding(cache: dict, img_path: Path, emb: np.ndarray, face_count: int = 1) -> None:
+    cache[str(img_path.resolve())] = {
+        "mtime":      img_path.stat().st_mtime,
+        "embedding":  emb.tolist(),
+        "face_count": face_count,
+    }
 
 
 # ── Image collection ──────────────────────────────────────────────────────────
+
+_SKIP_FOLDERS = {"Others", "Group"}   # auto-created destination folders
 
 def collect_images(src: Path, recursive: bool, faces: Path) -> list[Path]:
     """
     Gather all image files from src.
     - recursive=False : main folder only
     - recursive=True  : all subfolders, but always skips the Faces folder
-                        and any destination subfolders that look like person names.
+                        and the auto-created Others / Group destination folders.
     """
     glob_pattern = "**/*" if recursive else "*"
     return sorted(
         p for p in src.glob(glob_pattern)
         if p.is_file()
         and p.suffix.lower() in _IMAGE_EXTS
-        and faces not in p.parents        # never scan the Faces folder
+        and faces not in p.parents                       # skip Faces folder
         and p.parent != faces
+        and not any(part in _SKIP_FOLDERS                # skip Others / Group
+                    for part in p.relative_to(src).parts)
     )
 
 
@@ -400,7 +560,6 @@ def write_html_report(
     threshold: float,
     dry_run: bool,
     recursive: bool,
-    unmatched_images: list[Path] | None = None,
 ) -> None:
     by_person: dict[str, list[dict]] = defaultdict(list)
     for m in matches:
@@ -408,16 +567,22 @@ def write_html_report(
 
     mode_label = "DRY RUN — preview only, no files moved" if dry_run else "⚠ EXECUTED — files have been moved"
     mode_color = "#f0c040" if dry_run else "#ff6060"
-    
-    # Count total persons including Others if there are unmatched images
-    total_persons = len(by_person)
-    if unmatched_images:
-        total_persons += 1  # Others folder
+
+    # Sort order: named persons → Group → Others
+    special = {"Group", "Others"}
+    sorted_persons = (
+        sorted(p for p in by_person if p not in special)
+        + [p for p in ("Group", "Others") if p in by_person]
+    )
 
     cards_html = []
-    # Add matched persons sections
-    for person in sorted(by_person):
+    for person in sorted_persons:
         group = sorted(by_person[person], key=lambda m: -m["score"])
+        folder_color = (
+            "#d88ffc" if person == "Group" else
+            "#888888" if person == "Others" else
+            "#6bf"
+        )
         imgs  = "".join(
             f"""<div class="card">
               <img src="data:image/jpeg;base64,{_b64_thumb(m['img_path'], m['bbox'])}"
@@ -429,29 +594,10 @@ def write_html_report(
         )
         cards_html.append(f"""
         <section>
-          <h2>{person}
+          <h2 style="color:{folder_color}">{person}
             <span class="count">{len(group)} image{"s" if len(group)!=1 else ""}</span>
           </h2>
           <div class="grid">{imgs}</div>
-        </section>""")
-    
-    # Add Others section for unmatched images
-    if unmatched_images:
-        unmatched_imgs = "".join(
-            f"""<div class="card">
-              <img src="data:image/jpeg;base64,{_b64_thumb(img_path, None)}"
-                   title="{img_path.name}">
-              <div class="fname">{img_path.name}</div>
-              <div class="score">—</div>
-            </div>"""
-            for img_path in sorted(unmatched_images)
-        )
-        cards_html.append(f"""
-        <section>
-          <h2>Others
-            <span class="count">{len(unmatched_images)} image{"s" if len(unmatched_images)!=1 else ""}</span>
-          </h2>
-          <div class="grid">{unmatched_imgs}</div>
         </section>""")
 
     html = f"""<!DOCTYPE html>
@@ -482,9 +628,10 @@ def write_html_report(
     Mode: <span class="mode">{mode_label}</span> &nbsp;|&nbsp;
     Threshold: {threshold} &nbsp;|&nbsp;
     Recursive: {'yes' if recursive else 'no'} &nbsp;|&nbsp;
-    Total matches: {len(matches)} &nbsp;|&nbsp;
-    Unmatched: {len(unmatched_images) if unmatched_images else 0} &nbsp;|&nbsp;
-    Persons: {total_persons}
+    Matched: {sum(1 for m in matches if m['person'] not in ('Others','Group'))} &nbsp;|&nbsp;
+    Group: {sum(1 for m in matches if m['person']=='Group')} &nbsp;|&nbsp;
+    Others: {sum(1 for m in matches if m['person']=='Others')} &nbsp;|&nbsp;
+    Persons: {len([p for p in by_person if p not in ('Others','Group')])}
   </p>
   {"".join(cards_html)}
 </body>
@@ -500,18 +647,20 @@ def print_summary(matches: list[dict]) -> None:
         by_person[m["person"]].append(m)
 
     table = Table(
-        title="Match summary",
+        title="Sort summary",
         show_lines=False,
         header_style="bold cyan",
-        min_width=58,
+        min_width=62,
     )
-    table.add_column("Person",  style="green")
-    table.add_column("Images",  justify="right",  style="bold white")
-    table.add_column("Avg sim", justify="right",  style="yellow")
-    table.add_column("Min",     justify="right",  style="dim")
-    table.add_column("Max",     justify="right",  style="dim")
+    table.add_column("Folder",   style="green")
+    table.add_column("Images",   justify="right", style="bold white")
+    table.add_column("Avg sim",  justify="right", style="yellow")
+    table.add_column("Min",      justify="right", style="dim")
+    table.add_column("Max",      justify="right", style="dim")
 
-    for person in sorted(by_person):
+    # Named persons first (sorted), then Group, then Others
+    special = {"Group", "Others"}
+    for person in sorted(p for p in by_person if p not in special):
         scores = [m["score"] for m in by_person[person]]
         table.add_row(
             person,
@@ -520,6 +669,17 @@ def print_summary(matches: list[dict]) -> None:
             f"{min(scores):.3f}",
             f"{max(scores):.3f}",
         )
+    for label, color in (("Group", "magenta"), ("Others", "dim")):
+        if label in by_person:
+            scores = [m["score"] for m in by_person[label]]
+            avg_s  = sum(scores) / len(scores)
+            table.add_row(
+                f"[{color}]{label}[/{color}]",
+                f"[{color}]{len(scores)}[/{color}]",
+                f"[{color}]{avg_s:.3f}[/{color}]",
+                f"[{color}]{min(scores):.3f}[/{color}]",
+                f"[{color}]{max(scores):.3f}[/{color}]",
+            )
 
     console.print(table)
 
@@ -615,9 +775,18 @@ def main() -> None:
     scan_scope = "recursively" if args.recursive else "main folder only"
     console.print(f"  [cyan]{len(all_images)}[/cyan] images found  ({scan_scope})\n")
 
+    # ── Load embedding cache ────────────────────────────────────────────────
+    cache_path = src / "face_sort_cache.json"
+    emb_cache  = _load_cache(cache_path)
+    cache_size_before = len(emb_cache)
+    cache_hits  = 0
+
+    console.print("  [dim](Press [bold]ESC[/bold] at any time to abort and save progress)[/dim]\n")
+
     # ── Match loop ───────────────────────────────────────────────────────────
+    # all_matches holds every image result — person match, Group, or Others.
+    # "person" field doubles as destination subfolder name.
     all_matches: list[dict] = []
-    matched_images: set[Path] = set()  # Track images that had matches
     t0 = time.time()
 
     with Progress(
@@ -632,36 +801,85 @@ def main() -> None:
     ) as progress:
         task = progress.add_task("[cyan]Matching faces[/cyan]", total=len(all_images))
         for img_path in all_images:
-            # Check for ESC key termination
-            if termination_manager.check_esc():
-                console.print("\n[yellow]⚠ Face matching cancelled by user (ESC key).[/yellow]")
-                console.print(f"[dim]Processed {len(all_matches)} matches before cancellation.[/dim]")
+            if _tm.is_terminating():
+                console.print("\n  [yellow]⚠  ESC pressed — saving cache and stopping.[/yellow]")
                 break
-                
-            hits = match_image(img_path, app, refs, args.threshold)
-            if hits:
-                matched_images.add(img_path)
-            all_matches.extend(hits)
+            had_cached = _get_cached_embedding(emb_cache, img_path)[0] is not None
+            hits, face_count = match_image(img_path, app, refs, args.threshold, cache=emb_cache)
+            if had_cached:
+                cache_hits += 1
+
+            # ── Categorise  (female-priority grouping) ──────────────────
+            # Rule: Group ONLY when 2+ RECOGNIZED female faces present.
+            #   • 1 recognized female + any males (known/unknown) → her folder.
+            #   • 1 recognized female + blurred/unrecognized       → her folder.
+            #   • 2+ recognized females                            → Group.
+            #   • 0 recognized females, 1+ recognized males        → best male's folder.
+            #   • 0 recognized at all                              → Others.
+            female_hits   = [h for h in hits if h.get("is_female", False)]
+            other_hits    = [h for h in hits if not h.get("is_female", False)]
+            n_rec_females = len(female_hits)
+
+            if n_rec_females >= 2:
+                # 2+ recognized females → Group
+                all_matches.append({
+                    "person":     "Group",
+                    "score":      round(max(h["score"] for h in female_hits), 4),
+                    "bbox":       female_hits[0]["bbox"],
+                    "img_path":   img_path,
+                    "face_count": face_count,
+                })
+            elif n_rec_females == 1:
+                # Exactly 1 recognized female → her folder (female takes priority over any males)
+                all_matches.append(female_hits[0])
+            elif other_hits:
+                # No recognized females; pick highest-scoring recognized male
+                best_male = max(other_hits, key=lambda h: h["score"])
+                all_matches.append(best_male)
+            else:
+                # No recognized faces at all → Others
+                all_matches.append({
+                    "person":     "Others",
+                    "score":      0.0,
+                    "bbox":       [0, 0, 0, 0],
+                    "img_path":   img_path,
+                    "face_count": face_count,
+                })
+
+            n_matched = sum(1 for m in all_matches if m["person"] not in ("Others", "Group"))
+            n_group   = sum(1 for m in all_matches if m["person"] == "Group")
+            n_others  = sum(1 for m in all_matches if m["person"] == "Others")
             progress.advance(task)
             progress.update(
                 task,
                 description=(
                     f"[cyan]Matching faces[/cyan]  "
-                    f"[green]{len(all_matches)} match{'es' if len(all_matches)!=1 else ''}[/green]"
+                    f"[green]{n_matched} matched[/green]  "
+                    f"[magenta]{n_group} group[/magenta]  "
+                    f"[dim]{n_others} others[/dim]"
                 ),
             )
 
-    # ── Identify unmatched images ───────────────────────────────────────────────
-    unmatched_images = [img for img in all_images if img not in matched_images]
-    
     elapsed = time.time() - t0
     rate    = len(all_images) / elapsed if elapsed > 0 else 0
+    n_matched = sum(1 for m in all_matches if m["person"] not in ("Others", "Group"))
+    n_group   = sum(1 for m in all_matches if m["person"] == "Group")
+    n_others  = sum(1 for m in all_matches if m["person"] == "Others")
     console.print(
         f"\n  [green]✓[/green]  Done — "
         f"[bold]{len(all_images)}[/bold] images in [bold]{elapsed:.1f}s[/bold] "
         f"([dim]{rate:.1f} img/s[/dim])  ·  "
-        f"[bold cyan]{len(all_matches)}[/bold cyan] matches  ·  "
-        f"[bold yellow]{len(unmatched_images)}[/bold yellow] unmatched\n"
+        f"[bold green]{n_matched}[/bold green] matched  "
+        f"[bold magenta]{n_group}[/bold magenta] group  "
+        f"[dim]{n_others}[/dim] others\n"
+    )
+
+    # ── Save embedding cache & print stats ───────────────────────────────────
+    _save_cache(emb_cache, cache_path)
+    new_entries = len(emb_cache) - cache_size_before
+    console.print(
+        f"  [dim]Cache: {cache_hits}/{len(all_images)} hits, "
+        f"{new_entries} new entries saved → {cache_path.name}[/dim]\n"
     )
 
     # ── Summary table ────────────────────────────────────────────────────────
@@ -670,35 +888,18 @@ def main() -> None:
         print_summary(all_matches)
     else:
         console.print("  [yellow]No matches found. Try lowering --threshold.[/yellow]")
-    
-    if unmatched_images:
-        console.print(f"  [yellow]Unmatched images[/yellow]: {len(unmatched_images)}")
     console.print()
 
-    # ── Save JSON log ────────────────────────────────────────────────────────
-    log_path = report.with_suffix(".json")
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(
-            [{**m, "img_path": str(m["img_path"])} for m in all_matches],
-            f, indent=2,
-        )
-
-    # ── HTML report ──────────────────────────────────────────────────────────
-    with console.status("[cyan]Generating HTML report …[/cyan]"):
-        write_html_report(all_matches, report, args.threshold, dry_run, args.recursive, unmatched_images)
-    console.print(f"  [green]✓[/green]  Report  →  [link={report.as_uri()}]{report}[/link]")
-    console.print(f"  [green]✓[/green]  Log     →  {log_path}\n")
-
     # ── Dry run: offer to continue ────────────────────────────────────────────
-    total_files_to_move = len(all_matches) + len(unmatched_images)
-    if dry_run and total_files_to_move > 0:
-        matched_persons = len(set(m['person'] for m in all_matches)) if all_matches else 0
+    if dry_run and all_matches:
+        persons_only = [m for m in all_matches if m["person"] not in ("Others", "Group")]
+        n_persons    = len(set(m["person"] for m in persons_only))
         console.print(Panel.fit(
             Text.assemble(
                 ("Dry run complete.\n", "bold yellow"),
-                (f"  {len(all_matches)} matches across "
-                 f"{matched_persons} persons.\n", "white"),
-                (f"  {len(unmatched_images)} unmatched images will move to Others folder.\n\n", "yellow"),
+                (f"  {len(persons_only)} matched  ·  "
+                 f"{n_group} → Group  ·  {n_others} → Others  ·  "
+                 f"{n_persons} person folder(s)\n\n", "white"),
                 ("Open the HTML report to review, then run again with  ", "dim"),
                 ("--execute", "bold cyan"),
                 ("  to move the files.", "dim"),
@@ -711,7 +912,8 @@ def main() -> None:
             args.execute = True
             dry_run      = False
         else:
-            console.print()
+            # Generate report from original paths (files not moved yet)
+            _gen_report(all_matches, report, args.threshold, dry_run, args.recursive)
             return
 
     # ── Move files ────────────────────────────────────────────────────────────
@@ -727,72 +929,65 @@ def main() -> None:
             TimeElapsedColumn(),
             console=console,
         ) as progress:
-            # Move matched images first
-            task = progress.add_task("[cyan]Moving matched files …[/cyan]", total=len(all_matches))
+            task = progress.add_task("[cyan]Moving …[/cyan]", total=len(all_matches))
             for m in all_matches:
-                # Check for ESC key termination
-                if termination_manager.check_esc():
-                    console.print("\n[yellow]⚠ File moving cancelled by user (ESC key).[/yellow]")
-                    console.print(f"[dim]{moved} files moved before cancellation.[/dim]")
-                    break
-                    
-                dest_dir = src / m["person"]
+                dest_dir = src / m["person"]   # "Kajal", "Group", or "Others"
                 dest_dir.mkdir(exist_ok=True)
                 dest = dest_dir / m["img_path"].name
                 if dest.exists():
                     dest = dest_dir / (m["img_path"].stem + "_dup" + m["img_path"].suffix)
                 try:
                     shutil.move(str(m["img_path"]), str(dest))
+                    m["img_path"] = dest   # ← update to new location for report
                     moved += 1
                 except Exception as exc:
                     console.print(f"  [red]ERR[/red]  {m['img_path'].name}: {exc}")
                     errors += 1
                 progress.advance(task)
-            
-            # Move unmatched images to Others folder
-            if unmatched_images:
-                task_others = progress.add_task("[cyan]Moving unmatched files to Others …[/cyan]", total=len(unmatched_images))
-                others_dir = src / "Others"
-                others_dir.mkdir(exist_ok=True)
-                
-                for img_path in unmatched_images:
-                    # Check for ESC key termination
-                    if termination_manager.check_esc():
-                        console.print("\n[yellow]⚠ File moving cancelled by user (ESC key).[/yellow]")
-                        console.print(f"[dim]{moved} files moved before cancellation.[/dim]")
-                        break
-                        
-                    dest = others_dir / img_path.name
-                    if dest.exists():
-                        dest = others_dir / (img_path.stem + "_dup" + img_path.suffix)
-                    try:
-                        shutil.move(str(img_path), str(dest))
-                        moved += 1
-                    except Exception as exc:
-                        console.print(f"  [red]ERR[/red]  {img_path.name}: {exc}")
-                        errors += 1
-                    progress.advance(task_others)
 
+        dest_folders = set(m["person"] for m in all_matches)
         console.print(
             f"\n  [green]✓[/green]  {moved} files moved  ·  {errors} errors\n"
         )
-        
-        matched_persons = len(set(m['person'] for m in all_matches)) if all_matches else 0
-        summary_parts = [f"{moved} images sorted"]
-        if matched_persons > 0:
-            summary_parts.append(f"{matched_persons} person folders")
-        if len(unmatched_images) > 0:
-            summary_parts.append(f"{len(unmatched_images)} to Others folder")
-        
         console.print(Panel.fit(
             Text.assemble(
                 ("Done! ", "bold green"),
-                (" ".join(summary_parts) + ".", "white"),
+                (f"{moved} images sorted into {len(dest_folders)} folders: ", "white"),
+                (", ".join(sorted(dest_folders)), "cyan"),
+                (".", "white"),
             ),
             border_style="green",
         ))
 
+    # ── Save JSON log ─────────────────────────────────────────────────────────
+    # (after move so img_path reflects final location)
+    log_path = report.with_suffix(".json")
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(
+            [{**m, "img_path": str(m["img_path"])} for m in all_matches],
+            f, indent=2,
+        )
+    console.print(f"  [green]✓[/green]  Log     →  {log_path}\n")
+
+    # ── HTML report — generated AFTER move so thumbnails read from new paths ──
+    _gen_report(all_matches, report, args.threshold, dry_run, args.recursive)
+
     console.print()
+
+
+def _gen_report(
+    all_matches: list[dict],
+    report: Path,
+    threshold: float,
+    dry_run: bool,
+    recursive: bool,
+) -> None:
+    """Generate JSON log + HTML report then print the link. Runs synchronously
+    so thumbnails are always read AFTER files have been moved to their final
+    destinations (fixes the blank-thumbnail race condition)."""
+    console.print(f"  [dim]Generating HTML report …[/dim]")
+    write_html_report(all_matches, report, threshold, dry_run, recursive)
+    console.print(f"  [green]✓[/green]  Report  →  [link={report.as_uri()}]{report}[/link]\n")
 
 
 if __name__ == "__main__":

@@ -15,12 +15,13 @@ Dependencies:
 - moviepy: Video processing and manipulation
 - Pillow (PIL): Image processing and GIF optimization
 - numpy: Numerical operations for frame processing
-- tqdm: Progress bars
+- rich: Progress bars and console UI
 - pathlib: Modern path handling
 """
 
 import os
 import sys
+import warnings
 import argparse
 import hashlib
 import time
@@ -28,13 +29,34 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 import logging
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
+# Suppress moviepy/ffmpeg UserWarnings before they break Rich's terminal rendering
+warnings.filterwarnings('ignore', category=UserWarning, module='moviepy')
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='moviepy')
+
+# Cap worker threads before heavy imports to avoid CPU thrashing
+_OMP_THREADS = min(os.cpu_count() or 2, 4)
+os.environ.setdefault("OMP_NUM_THREADS", str(_OMP_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(_OMP_THREADS))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_OMP_THREADS))
+
+try:
+    import psutil
+    psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if os.name == "nt" else 10)
+except Exception:
+    pass
+
 try:
     import moviepy
-    from moviepy.editor import VideoFileClip
+    # moviepy 2.x changed import structure - VideoFileClip is now in main module
+    try:
+        from moviepy import VideoFileClip
+    except ImportError:
+        # Fallback for older versions
+        from moviepy.editor import VideoFileClip
     try:
         from moviepy.video.fx import resize
     except ImportError:
@@ -64,143 +86,37 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from tqdm import tqdm
+    from rich.console import Console
+    from rich.progress import (
+        Progress, SpinnerColumn, BarColumn, TextColumn,
+        TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn,
+    )
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.prompt import Prompt, Confirm
+    console = Console()
 except ImportError:
-    print("Warning: tqdm not found. Progress bars will be disabled.")
-    tqdm = None
+    print("Error: rich is required. Install with: pip install rich")
+    sys.exit(1)
 
-# === Keyboard ESC termination support ===
-class _TerminationManager:
-    """Global termination manager to perform graceful shutdown on ESC.
+# === ESC-key termination via shared TerminationManager ===
+import sys as _sys_tmp
+_scripts_dir = str(Path(__file__).parent / "src" / "scripts")
+if _scripts_dir not in _sys_tmp.path:
+    _sys_tmp.path.insert(0, _scripts_dir)
+from common_utils import TerminationManager as _TerminationManager
+del _sys_tmp, _scripts_dir
+_tm = _TerminationManager()
+_tm.start_monitoring()
 
-    - Registers cleanup callbacks for resources/files
-    - Provides immediate termination with exit code 0 after cleanup
-    - Cross-platform keyboard listener uses pynput if available, else fallbacks
-    """
-
-    def __init__(self):
-        self._cleanup = []
-        self._event = threading.Event()
-
-    def register_cleanup(self, fn):
-        if callable(fn):
-            self._cleanup.append(fn)
-
-    def request_terminate(self, reason: str = "Escape key"):
-        if self._event.is_set():
-            return
-        self._event.set()
-        try:
-            msg = "Termination requested via Escape. Cleaning up and exiting (code 0)."
-            print(msg)
-            logging.info(msg)
-        except Exception:
-            pass
-        # Run cleanup callbacks in LIFO order
-        for fn in reversed(self._cleanup):
-            try:
-                fn()
-            except Exception as e:
-                try:
-                    logging.error(f"Cleanup error: {e}")
-                except Exception:
-                    pass
-        # Immediate, graceful termination
-        os._exit(0)
-
-    def is_terminating(self) -> bool:
-        return self._event.is_set()
-
-
-_termination = _TerminationManager()
-
-
-def _flush_and_close_logging():
-    """Flush and close all logging handlers to prevent descriptor leaks."""
-    try:
-        logger = logging.getLogger()
-        for h in logger.handlers[:]:
-            try:
-                h.flush()
-                h.close()
-            except Exception:
-                pass
-        logger.handlers = []
-    except Exception:
-        pass
-
-
-def _start_keyboard_escape_listener():
-    """Start a background listener to detect ESC key presses.
-
-    Prefers pynput for true keydown events across OS. Falls back to platform
-    polling on Windows (msvcrt) and POSIX (select+stdin) without capturing
-    other keys. Only reacts to ESC, so other shortcuts are unaffected.
-    """
-    # Try pynput first for reliable keydown events
-    try:
-        from pynput import keyboard
-
-        def on_press(key):
-            try:
-                if key == keyboard.Key.esc:
-                    _termination.request_terminate("Escape key")
-            except Exception:
-                pass
-
-        listener = keyboard.Listener(on_press=on_press)
-        listener.daemon = True
-        listener.start()
-        return
-    except Exception:
-        pass
-
-    # Windows fallback using msvcrt
-    if os.name == 'nt':
-        try:
-            import msvcrt
-        except Exception:
-            return
-
-        def _win_poll():
-            while not _termination.is_terminating():
-                try:
-                    if msvcrt.kbhit():
-                        ch = msvcrt.getch()
-                        if ch in (b'\x1b',):  # ESC
-                            _termination.request_terminate("Escape key")
-                    time.sleep(0.05)
-                except Exception:
-                    time.sleep(0.1)
-
-        t = threading.Thread(target=_win_poll, daemon=True)
-        t.start()
+# Moviepy 2.x compatibility: subclip() was renamed to subclipped()
+def _subclip(clip, start_time=0, end_time=None):
+    """Handle both moviepy 1.x (subclip) and 2.x (subclipped) APIs."""
+    if hasattr(clip, 'subclipped'):
+        return clip.subclipped(start_time, end_time)
     else:
-        # POSIX fallback using select on stdin
-        try:
-            import select
-        except Exception:
-            return
-
-        def _posix_poll():
-            while not _termination.is_terminating():
-                try:
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
-                    if rlist:
-                        ch = sys.stdin.read(1)
-                        if ch == '\x1b':  # ESC
-                            _termination.request_terminate("Escape key")
-                except Exception:
-                    time.sleep(0.1)
-
-        t = threading.Thread(target=_posix_poll, daemon=True)
-        t.start()
-
-
-def _setup_escape_termination():
-    """Register cleanup tasks and start the ESC listener."""
-    _termination.register_cleanup(_flush_and_close_logging)
-    _start_keyboard_escape_listener()
+        return clip.subclip(start_time, end_time)
 
 
 @dataclass
@@ -215,7 +131,7 @@ class ConversionConfig:
     eliminate_local_color_tables: bool = False
     delete_source: bool = True
     verify_before_delete: bool = True
-    max_workers: int = 4
+    max_workers: int = field(default_factory=lambda: min(os.cpu_count() or 2, 4))
     # WebP defaults
     webp_lossless: bool = False
     webp_method: int = 4  # 0-6, higher = better compression, slower
@@ -260,18 +176,10 @@ class VideoToGifConverter:
         }
     
     def _setup_logger(self) -> logging.Logger:
-        """Setup logging configuration."""
+        """Return named logger; output handled by root RichHandler configured in main()."""
         logger = logging.getLogger('video_to_gif')
-        logger.setLevel(logging.INFO)
-        
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            )
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
-        
+        logger.setLevel(logging.DEBUG)   # root handler gates the actual level
+        logger.propagate = True          # let RichHandler on root render it
         return logger
     
     def is_supported_video(self, file_path: Path) -> bool:
@@ -467,7 +375,7 @@ class VideoToGifConverter:
             ]
             
             for strategy_name, strategy_func in strategies:
-                if _termination.is_terminating():
+                if _tm.is_terminating():
                     self.logger.info(f"Optimization terminated by user during {strategy_name} strategy")
                     break
                     
@@ -843,9 +751,9 @@ class VideoToGifConverter:
                 with VideoFileClip(str(video_path)) as clip:
                     # Apply time range
                     if end_time is not None:
-                        clip = clip.subclip(start_time, min(end_time, clip.duration))
+                        clip = _subclip(clip, start_time, min(end_time, clip.duration))
                     elif start_time > 0:
-                        clip = clip.subclip(start_time)
+                        clip = _subclip(clip, start_time)
                     # Determine target width as in GIF conversion
                     if width is not None:
                         target_width = width
@@ -941,9 +849,9 @@ class VideoToGifConverter:
             with VideoFileClip(str(video_path)) as clip:
                 # Apply time range
                 if end_time is not None:
-                    clip = clip.subclip(start_time, min(end_time, clip.duration))
+                    clip = _subclip(clip, start_time, min(end_time, clip.duration))
                 elif start_time > 0:
-                    clip = clip.subclip(start_time)
+                    clip = _subclip(clip, start_time)
                 
                 # Enhanced: Use original video width as default, capped at max_width
                 if width is not None:
@@ -1064,123 +972,67 @@ class VideoToGifConverter:
             return self._batch_convert_sequential(video_files, output_dir, **kwargs)
     
     def _batch_convert_sequential(self, video_files: List[Path], output_dir: Path, **kwargs) -> List[ConversionResult]:
-        """Sequential batch conversion with unified progress tracking."""
+        """Sequential batch conversion with unified Rich progress tracking."""
         total_files = len(video_files)
         results = []
-        processed_files = 0
         output_format = kwargs.get('output_format', 'gif').lower()
-        progress_style = kwargs.get('progress', 'simple')
-        # Filter kwargs passed to conversion functions
-        kwargs_filtered = kwargs.copy()
-        kwargs_filtered.pop('output_format', None)
-        kwargs_filtered.pop('progress', None)
-        
-        if tqdm and progress_style != 'none':
-            # Unified, simple progress bar for batch processing
-            bar_desc = "Batch Converting" if progress_style == 'simple' else "Batch Converting (verbose)"
-            with tqdm(total=total_files, desc=bar_desc, unit="files", dynamic_ncols=True, mininterval=0.15) as batch_pbar:
-                for i, video_path in enumerate(video_files, 1):
-                    # Update progress bar description with current file info
-                    filename = video_path.name
-                    batch_pbar.set_description(f"Converting [{i}/{total_files}]")
-                    
-                    ext = '.gif' if output_format == 'gif' else '.webp'
-                    output_path = output_dir / f"{video_path.stem}{ext}"
-                    
-                    # Temporarily disable individual file progress to avoid conflicts
-                    kwargs_no_progress = kwargs.copy()
-                    kwargs_no_progress.pop('output_format', None)
-                    kwargs_no_progress.pop('progress', None)
-                    
-                    try:
-                        if output_format == 'gif':
-                            result = self.convert_video_to_gif(
-                                video_path=video_path,
-                                output_path=output_path,
-                                **kwargs_no_progress
-                            )
-                        else:
-                            result = self.convert_video_to_webp(
-                                video_path=video_path,
-                                output_path=output_path,
-                                **kwargs_no_progress
-                            )
-                        
-                        results.append(result)
-                        
-                    except Exception as e:
-                        self.logger.error(f"Failed to convert {video_path.name}: {e}")
-                        results.append(ConversionResult(success=False, error=str(e)))
-                    
-                    processed_files = i
-                    batch_pbar.update(1)
-                    
-                    # Final status update
-                    if i == total_files:
-                        batch_pbar.set_description("Batch Conversion Complete")
-        else:
-            # Fallback without tqdm - simple counter display
-            print(f"\nBatch converting {total_files} files...")
-            for i, video_path in enumerate(video_files, 1):
-                print(f"\n[{i}/{total_files}] Processing: {video_path.name}")
-                
+        kwargs_filtered = {k: v for k, v in kwargs.items() if k not in ('output_format', 'progress')}
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(bar_width=36),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=6,
+        ) as progress:
+            task = progress.add_task(
+                f"[cyan]Converting ({output_format.upper()})…[/cyan]", total=total_files
+            )
+            n_ok = 0
+            n_fail = 0
+            for video_path in video_files:
+                if _tm.is_terminating():
+                    break
                 ext = '.gif' if output_format == 'gif' else '.webp'
                 output_path = output_dir / f"{video_path.stem}{ext}"
-                
+                progress.update(task, description=f"[cyan]Converting[/cyan] {video_path.name}")
                 try:
                     if output_format == 'gif':
                         result = self.convert_video_to_gif(
-                            video_path=video_path,
-                            output_path=output_path,
-                            **kwargs_filtered
+                            video_path=video_path, output_path=output_path, **kwargs_filtered
                         )
                     else:
                         result = self.convert_video_to_webp(
-                            video_path=video_path,
-                            output_path=output_path,
-                            **kwargs_filtered
+                            video_path=video_path, output_path=output_path, **kwargs_filtered
                         )
-                    
                     results.append(result)
                     if result.success:
-                        print(f"✓ Successfully converted: {video_path.name}")
+                        n_ok += 1
                     else:
-                        print(f"✗ Failed to convert: {video_path.name}")
-                        
+                        n_fail += 1
                 except Exception as e:
                     self.logger.error(f"Failed to convert {video_path.name}: {e}")
-                    print(f"✗ Error converting {video_path.name}: {e}")
                     results.append(ConversionResult(success=False, error=str(e)))
-                
-                processed_files = i
-            
-            # Final summary (kept concise)
-            successful = sum(1 for r in results if r.success)
-            success_rate = (successful/total_files)*100 if total_files > 0 else 0
-            print(f"\n=== Batch Conversion Complete ===")
-            print(f"Total files: {total_files}")
-            print(f"Successfully converted: {successful}")
-            print(f"Failed: {total_files - successful}")
-            print(f"Success rate: {success_rate:.1f}%")
-        
+                    n_fail += 1
+                progress.advance(task)
+                progress.update(task, description=f"[cyan]Converting[/cyan] ✓{n_ok} ✗{n_fail}")
+
         successful = sum(1 for r in results if r.success)
-        self.logger.info(f"Sequential batch conversion complete: {successful}/{total_files} files converted successfully")
+        self.logger.info(f"Sequential batch complete: {successful}/{total_files} converted")
         return results
     
     def _batch_convert_concurrent(self, video_files: List[Path], output_dir: Path, max_workers: Optional[int], **kwargs) -> List[ConversionResult]:
-        """Concurrent batch conversion with thread pool."""
+        """Concurrent batch conversion with unified Rich progress bar."""
         total_files = len(video_files)
         max_workers = max_workers or min(self.config.max_workers, len(video_files))
         output_format = kwargs.get('output_format', 'gif').lower()
-        progress_style = kwargs.get('progress', 'simple')
-        self.logger.info(f"Starting concurrent conversion with {max_workers} workers")
+        kwargs_filtered = {k: v for k, v in kwargs.items() if k not in ('output_format', 'progress')}
         results = [None] * total_files
-        completed_count = 0
-        # Filter kwargs passed to conversion functions
-        kwargs_filtered = kwargs.copy()
-        kwargs_filtered.pop('output_format', None)
-        kwargs_filtered.pop('progress', None)
-        
+        self.logger.info(f"Starting concurrent conversion with {max_workers} workers")
+
         def convert_single_file(index_and_path):
             index, video_path = index_and_path
             ext = '.gif' if output_format == 'gif' else '.webp'
@@ -1188,161 +1040,121 @@ class VideoToGifConverter:
             try:
                 if output_format == 'gif':
                     result = self.convert_video_to_gif(
-                        video_path=video_path,
-                        output_path=output_path,
-                        **kwargs_filtered
+                        video_path=video_path, output_path=output_path, **kwargs_filtered
                     )
                 else:
                     result = self.convert_video_to_webp(
-                        video_path=video_path,
-                        output_path=output_path,
-                        **kwargs_filtered
+                        video_path=video_path, output_path=output_path, **kwargs_filtered
                     )
                 return index, result
             except Exception as e:
                 self.logger.error(f"Failed to convert {video_path.name}: {e}")
                 return index, ConversionResult(success=False, error=str(e))
-        
-        if tqdm and progress_style != 'none':
-            desc = "Concurrent Converting" if progress_style == 'simple' else f"Concurrent Converting ({max_workers} workers)"
-            with tqdm(total=total_files, desc=desc, unit="files", dynamic_ncols=True, mininterval=0.15) as pbar:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_index = { executor.submit(convert_single_file, (i, video_path)): i for i, video_path in enumerate(video_files) }
-                    for future in as_completed(future_to_index):
-                        try:
-                            index, result = future.result()
-                            results[index] = result
-                            completed_count += 1
-                            pbar.update(1)
-                        except Exception as e:
-                            self.logger.error(f"Task execution error: {e}")
-                            index = future_to_index[future]
-                            results[index] = ConversionResult(success=False, error=str(e))
-                            completed_count += 1
-                            pbar.update(1)
-        else:
-            print(f"\nConcurrent batch converting {total_files} files with {max_workers} workers...")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(bar_width=36),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=6,
+        ) as progress:
+            task = progress.add_task(
+                f"[cyan]Converting ({max_workers} workers)…[/cyan]", total=total_files
+            )
+            n_ok = 0
+            n_fail = 0
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_index = { executor.submit(convert_single_file, (i, video_path)): i for i, video_path in enumerate(video_files) }
+                future_to_index = {
+                    executor.submit(convert_single_file, (i, vp)): i
+                    for i, vp in enumerate(video_files)
+                }
                 for future in as_completed(future_to_index):
+                    if _tm.is_terminating():
+                        break
                     try:
                         index, result = future.result()
                         results[index] = result
-                        completed_count += 1
-                        successful = sum(1 for r in results if r and r.success)
-                        print(f"Progress: {completed_count}/{total_files} | Success: {successful} | Failed: {completed_count - successful}")
+                        if result.success:
+                            n_ok += 1
+                        else:
+                            n_fail += 1
                     except Exception as e:
-                        self.logger.error(f"Task execution error: {e}")
-                        index = future_to_index[future]
-                        results[index] = ConversionResult(success=False, error=str(e))
-                        completed_count += 1
+                        self.logger.error(f"Task error: {e}")
+                        results[future_to_index[future]] = ConversionResult(success=False, error=str(e))
+                        n_fail += 1
+                    progress.advance(task)
+                    progress.update(task, description=f"[cyan]Converting[/cyan] ✓{n_ok} ✗{n_fail}")
+
         results = [r for r in results if r is not None]
         successful = sum(1 for r in results if r.success)
-        self.logger.info(f"Concurrent batch conversion complete: {successful}/{total_files} files converted successfully")
+        self.logger.info(f"Concurrent batch complete: {successful}/{total_files} converted")
         return results
 
 
 def ai_select_format(input_path: Path) -> str:
     """AI-powered format selection based on input characteristics and user preferences."""
-    print("\n🤖 AI Format Selection")
-    print("=" * 40)
-    
-    # Analyze input characteristics
-    is_directory = input_path.is_dir()
-    
-    if is_directory:
-        # For batch processing, analyze a few sample files
+    console.print(Panel.fit("[bold cyan]AI Format Selection[/bold cyan]"))
+
+    if input_path.is_dir():
         video_files = []
         for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']:
             video_files.extend(input_path.glob(f"*{ext}"))
             video_files.extend(input_path.glob(f"*{ext.upper()}"))
-        
+
         if not video_files:
-            print("📁 No video files found in directory. Defaulting to GIF format.")
+            console.print("[dim]No video files found. Defaulting to GIF.[/dim]")
             return 'gif'
-        
-        # Analyze first few files
+
         sample_files = video_files[:3]
-        total_size_mb = sum(f.stat().st_size for f in sample_files) / (1024 * 1024)
-        avg_size_mb = total_size_mb / len(sample_files)
-        
-        print(f"📊 Batch Analysis:")
-        print(f"   • Total videos found: {len(video_files)}")
-        print(f"   • Sample files analyzed: {len(sample_files)}")
-        print(f"   • Average file size: {avg_size_mb:.1f}MB")
-        
-        # AI recommendation logic for batch
+        avg_size_mb = sum(f.stat().st_size for f in sample_files) / len(sample_files) / (1024 * 1024)
+
+        tbl = Table(show_header=False, box=None, padding=(0, 2))
+        tbl.add_row("Total videos", str(len(video_files)))
+        tbl.add_row("Avg sample size", f"{avg_size_mb:.1f} MB")
+        console.print(tbl)
+
         if len(video_files) > 10:
-            recommendation = 'webp'
-            reason = "Large batch processing - WebP offers better compression and quality"
+            recommendation, reason = 'webp', "Large batch — WebP offers better compression"
         elif avg_size_mb > 50:
-            recommendation = 'webp'
-            reason = "Large file sizes detected - WebP provides superior compression"
+            recommendation, reason = 'webp', "Large files — WebP provides superior compression"
         else:
-            recommendation = 'gif'
-            reason = "Moderate batch size - GIF offers universal compatibility"
-    
+            recommendation, reason = 'gif', "Moderate batch — GIF offers universal compatibility"
     else:
-        # Single file analysis
         try:
             file_size_mb = input_path.stat().st_size / (1024 * 1024)
-            print(f"📊 File Analysis:")
-            print(f"   • File size: {file_size_mb:.1f}MB")
-            print(f"   • File name: {input_path.name}")
-            
-            # AI recommendation logic for single file
+            tbl = Table(show_header=False, box=None, padding=(0, 2))
+            tbl.add_row("File", input_path.name)
+            tbl.add_row("Size", f"{file_size_mb:.1f} MB")
+            console.print(tbl)
+
             if file_size_mb > 100:
-                recommendation = 'webp'
-                reason = "Large file size - WebP will provide better compression"
+                recommendation, reason = 'webp', "Large file — WebP provides better compression"
             elif 'gif' in input_path.name.lower() or 'animated' in input_path.name.lower():
-                recommendation = 'gif'
-                reason = "File appears to be animation-related - GIF format recommended"
+                recommendation, reason = 'gif', "Animation-related filename — GIF recommended"
             elif file_size_mb < 10:
-                recommendation = 'gif'
-                reason = "Small file size - GIF will be lightweight and compatible"
+                recommendation, reason = 'gif', "Small file — GIF will be lightweight"
             else:
-                recommendation = 'webp'
-                reason = "Moderate file size - WebP offers better quality/size ratio"
-        
+                recommendation, reason = 'webp', "Moderate size — WebP offers better quality/size ratio"
         except Exception:
-            recommendation = 'gif'
-            reason = "Unable to analyze file - Defaulting to GIF for compatibility"
-    
-    print(f"\n🎯 AI Recommendation: {recommendation.upper()}")
-    print(f"💡 Reason: {reason}")
-    
-    # Interactive confirmation
-    while True:
-        user_choice = input(f"\nUse {recommendation.upper()} format? [Y/n]: ").strip().lower()
-        
-        if user_choice in ('', 'y', 'yes'):
-            print(f"✅ Selected: {recommendation.upper()}")
-            return recommendation
-        elif user_choice in ('n', 'no'):
-            # Let user choose manually
-            print("\n📋 Available formats:")
-            print("   1. GIF - Universal compatibility, good for simple animations")
-            print("   2. WebP - Better compression, supports transparency, higher quality")
-            
-            while True:
-                format_choice = input("Choose format [1/2]: ").strip()
-                if format_choice == '1':
-                    print("✅ Selected: GIF")
-                    return 'gif'
-                elif format_choice == '2':
-                    print("✅ Selected: WebP")
-                    return 'webp'
-                else:
-                    print("❌ Please enter 1 or 2")
-        else:
-            print("❌ Please enter Y or N")
+            recommendation, reason = 'gif', "Unable to analyze — defaulting to GIF"
+
+    console.print(f"\n[bold green]Recommendation:[/bold green] [bold]{recommendation.upper()}[/bold] — {reason}")
+
+    if Confirm.ask(f"  Use [bold]{recommendation.upper()}[/bold]?", default=True):
+        return recommendation
+
+    console.print("\n[dim]Available formats:[/dim]")
+    console.print("  [cyan]1[/cyan]. GIF  — universal compatibility")
+    console.print("  [cyan]2[/cyan]. WebP — better compression, higher quality")
+    choice = Prompt.ask("  Format", choices=["1", "2"])
+    return 'gif' if choice == "1" else 'webp'
 
 
 def main():
     """Main function for command-line interface."""
-    # Setup global ESC termination listener for immediate graceful exit
-    _setup_escape_termination()
-
     parser = argparse.ArgumentParser(
         description="Convert videos to GIF or WebP with duration-aware behavior and optional source preservation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1522,42 +1334,44 @@ Deprecated:
 
     # Handle deprecated flags
     if getattr(args, 'deprecated_delete_source', False):
-        print("[DEPRECATED] --delete-source is deprecated. Use --keepSourceFile false.")
+        console.print("[yellow][DEPRECATED][/yellow] --delete-source is deprecated. Use --keepSourceFile false.")
         if args.keepSourceFile is None:
             args.keepSourceFile = 'false'
     if getattr(args, 'list_params', False):
-        print("[DEPRECATED] --params is deprecated. Use --help for comprehensive documentation.\n")
+        console.print("[yellow][DEPRECATED][/yellow] --params is deprecated. Use --help for comprehensive documentation.\n")
         parser.print_help()
         return
-    
-    # Setup logging with timestamps
-    log_level = logging.DEBUG if args.verbose else logging.INFO
+
+    # Route all logging through Rich so it renders cleanly alongside Progress
+    from rich.logging import RichHandler
+    log_level = logging.DEBUG if args.verbose else logging.WARNING
     logging.basicConfig(
         level=log_level,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        format='%(message)s',
+        datefmt='[%X]',
+        handlers=[RichHandler(console=console, rich_tracebacks=False, show_path=False)],
     )
-    
+
     # Interactive mode if no input provided
     if not args.input:
-        print("Video Converter (GIF/WebP)")
-        print("=" * 50)
-        
-        input_path = input("Enter video file path or directory: ").strip().strip('"\'')
-        if not input_path:
-            print("No input provided. Exiting.")
+        console.print(Panel.fit(
+            Text.assemble(("Video Converter", "bold cyan"), " — GIF / WebP"),
+            subtitle="[dim]Press ESC to abort[/dim]",
+        ))
+
+        raw = Prompt.ask("  [cyan]Input file or directory[/cyan]").strip().strip('"\'')
+        if not raw:
+            console.print("[red]No input provided.[/red]")
             return
-        
-        args.input = input_path
-        
-        # Prompt for format if not specified
+        args.input = raw
+
         if not args.format:
-            choice = input("Select output format [gif/webp] (default: gif): ").strip().lower()
-            args.format = 'webp' if choice == 'webp' else 'gif'
-        
-        # Optional output path/dir
-        output_path = input("Enter output file or directory (optional): ").strip().strip('"\'')
-        if output_path:
-            args.output = output_path
+            fmt = Prompt.ask("  [cyan]Output format[/cyan]", choices=["gif", "webp"], default="gif")
+            args.format = fmt
+
+        raw_out = Prompt.ask("  [cyan]Output file or directory[/cyan] (optional, Enter to skip)", default="").strip().strip('"\'')
+        if raw_out:
+            args.output = raw_out
     
     # Create converter with configuration
     config = ConversionConfig()
@@ -1570,54 +1384,31 @@ Deprecated:
     if args.format == 'ai':
         args.format = ai_select_format(input_path)
 
-    # Helper: prompt for output format (WEBP/GIF), default WEBP
     def _prompt_format(default: str = 'webp') -> str:
-        try:
-            choice = input("Select output format [WEBP/GIF] (default: WEBP): ").strip()
-        except Exception:
-            choice = ''
-        if not choice:
-            return default.lower()
-        choice_lower = choice.lower()
-        if choice_lower in ('webp', 'gif'):
-            return choice_lower
-        print("Invalid selection. Defaulting to WEBP.")
-        return default.lower()
+        return Prompt.ask("  [cyan]Output format[/cyan]", choices=["webp", "gif"], default=default.lower())
 
-    # Helper: prompt for output directory (mandatory)
     def _prompt_output_dir() -> Path:
         while True:
-            try:
-                out = input("Enter output directory path (mandatory): ").strip().strip('"\'')
-            except Exception:
-                out = ''
+            out = Prompt.ask("  [cyan]Output directory[/cyan] (required)").strip().strip('"\'')
             if not out:
-                print("Output directory is required.")
+                console.print("[red]Output directory is required.[/red]")
                 continue
             p = Path(out)
             try:
                 p.mkdir(parents=True, exist_ok=True)
                 return p
             except Exception as e:
-                print(f"Cannot create/use output directory: {e}")
-                continue
+                console.print(f"[red]Cannot create directory: {e}[/red]")
 
-    # Helper: prompt optional FPS (returns None if empty)
     def _prompt_fps_optional() -> Optional[int]:
-        try:
-            val = input("Enter FPS (optional; press Enter to use original): ").strip()
-        except Exception:
-            val = ''
+        val = Prompt.ask("  [cyan]FPS[/cyan] (Enter to use original)", default="").strip()
         if not val:
             return None
         try:
             fps_i = int(val)
-            if fps_i <= 0:
-                print("FPS must be a positive integer. Using original.")
-                return None
-            return fps_i
+            return fps_i if fps_i > 0 else None
         except Exception:
-            print("Invalid FPS. Using original.")
+            console.print("[yellow]Invalid FPS. Using original.[/yellow]")
             return None
     
     try:
@@ -1628,7 +1419,7 @@ Deprecated:
 
             mp4_files = [p for p in input_path.glob('**/*.mp4') if p.is_file()]
             if not mp4_files:
-                print("No MP4 files found in directory.")
+                console.print("[yellow]No MP4 files found in directory.[/yellow]")
                 return
 
             # Format selection: prompt if not provided
@@ -1651,112 +1442,115 @@ Deprecated:
             if args.keepSourceFile is not None:
                 cli_keep = True if str(args.keepSourceFile).lower() == 'true' else False
 
-            print(f"Processing {len(mp4_files)} MP4 file(s) → {selected_format.upper()} | Output: {output_dir}")
+            console.print(f"  Processing [bold]{len(mp4_files)}[/bold] MP4 file(s) → [bold cyan]{selected_format.upper()}[/bold cyan] | Output: {output_dir}")
 
-            for src in mp4_files:
-                try:
+            n_ok = 0
+            n_fail = 0
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("{task.description}"),
+                BarColumn(bar_width=36),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+                refresh_per_second=6,
+            ) as progress:
+                task = progress.add_task(
+                    f"[cyan]Converting ({selected_format.upper()})…[/cyan]",
+                    total=len(mp4_files),
+                )
+                for src in mp4_files:
+                  try:
+                    if _tm.is_terminating():
+                        break
+                    progress.update(task, description=f"[cyan]Converting[/cyan] {src.name}")
                     info = converter.get_video_info(src)
                     if not info or 'duration' not in info or info['duration'] is None:
                         logging.error(f"Unable to determine duration for: {src}")
+                        progress.advance(task)
                         continue
                     duration = float(info['duration'])
                     orig_fps = info.get('fps') or converter.config.default_fps
-                    # Decide FPS
                     fps_used = fps_override if fps_override is not None else int(max(1, int(orig_fps)))
-
-                    # Output path in specified output directory with new extension
                     out_path = (output_dir / src.name).with_suffix('.' + selected_format)
 
-                    logging.info(
-                        f"File: {src.name} | duration={duration:.2f}s | type={selected_format.upper()} | fps={fps_used}"
-                    )
-
                     if duration > 15:
-                        # Trim to 15s, preserve source by default
                         keep_flag = cli_keep if cli_keep is not None else True
                         if selected_format == 'webp':
                             res = converter.convert_video_to_webp(
-                                video_path=src,
-                                output_path=out_path,
-                                start_time=0,
-                                end_time=15,
-                                fps=fps_used,
-                                width=None,
-                                quality=converter.config.default_quality,
-                                optimize_size=False,
-                                keepSourceFile=keep_flag
+                                video_path=src, output_path=out_path,
+                                start_time=0, end_time=15, fps=fps_used,
+                                width=None, quality=converter.config.default_quality,
+                                optimize_size=False, keepSourceFile=keep_flag,
                             )
                         else:
                             res = converter.convert_video_to_gif(
-                                video_path=src,
-                                output_path=out_path,
-                                start_time=0,
-                                end_time=15,
-                                fps=fps_used,
-                                width=None,
-                                quality=converter.config.default_quality,
-                                optimize_size=False,
-                                keepSourceFile=keep_flag
+                                video_path=src, output_path=out_path,
+                                start_time=0, end_time=15, fps=fps_used,
+                                width=None, quality=converter.config.default_quality,
+                                optimize_size=False, keepSourceFile=keep_flag,
                             )
                     else:
-                        # Process full video, delete source on success by default
                         keep_flag = cli_keep if cli_keep is not None else False
                         if selected_format == 'webp':
                             res = converter.convert_video_to_webp(
-                                video_path=src,
-                                output_path=out_path,
-                                start_time=0,
-                                end_time=None,
-                                fps=fps_used,
-                                width=None,
-                                quality=converter.config.default_quality,
-                                optimize_size=False,
-                                keepSourceFile=keep_flag
+                                video_path=src, output_path=out_path,
+                                start_time=0, end_time=None, fps=fps_used,
+                                width=None, quality=converter.config.default_quality,
+                                optimize_size=False, keepSourceFile=keep_flag,
                             )
                         else:
                             res = converter.convert_video_to_gif(
-                                video_path=src,
-                                output_path=out_path,
-                                start_time=0,
-                                end_time=None,
-                                fps=fps_used,
-                                width=None,
-                                quality=converter.config.default_quality,
-                                optimize_size=False,
-                                keepSourceFile=keep_flag
+                                video_path=src, output_path=out_path,
+                                start_time=0, end_time=None, fps=fps_used,
+                                width=None, quality=converter.config.default_quality,
+                                optimize_size=False, keepSourceFile=keep_flag,
                             )
 
                     if res.success:
                         successful.append(res)
-                        logging.info(f"Success: {res.output_path}")
-                        # Verify deletion status for short videos
+                        n_ok += 1
                         if duration <= 15:
                             if res.source_deleted:
                                 deleted_success += 1
-                            else:
-                                # Verify existence and record failure detail
-                                if src.exists():
-                                    deleted_fail += 1
-                                    deletion_fail_details.append(f"Not deleted: {src}")
+                            elif src.exists():
+                                deleted_fail += 1
+                                deletion_fail_details.append(f"Not deleted: {src}")
                     else:
                         failed.append(res)
-                        logging.error(f"Failed: {src} → {selected_format.upper()} | {res.error}")
-                except Exception as e:
+                        n_fail += 1
+                  except Exception as e:
                     logging.error(f"Error processing {src}: {e}")
+                    n_fail += 1
+                  finally:
+                    progress.advance(task)
+                    progress.update(task, description=f"[cyan]Converting[/cyan] ✓{n_ok} ✗{n_fail}")
 
-            # Summary
-            print("\n=== Batch Conversion Summary ===")
-            print(f"Total MP4 files: {len(mp4_files)}")
-            print(f"Successful: {len(successful)}")
-            print(f"Failed: {len(failed)}")
-            print(f"Deleted (≤15s): {deleted_success}")
+            # Batch summary
+            tbl = Table(title="Batch Conversion Summary", show_lines=False, header_style="bold cyan")
+            tbl.add_column("Metric")
+            tbl.add_column("Value", justify="right")
+            tbl.add_row("Total MP4 files", str(len(mp4_files)))
+            tbl.add_row("[green]Successful[/green]", str(len(successful)))
+            tbl.add_row("[red]Failed[/red]", str(len(failed)))
+            tbl.add_row("Deleted (≤15s)", str(deleted_success))
             if deleted_fail > 0:
-                print(f"Deletion failures (≤15s): {deleted_fail}")
+                tbl.add_row("[yellow]Deletion failures[/yellow]", str(deleted_fail))
+            console.print(tbl)
+            if deleted_fail > 0:
                 for msg in deletion_fail_details[:10]:
-                    print(f"  ✗ {msg}")
+                    console.print(f"  [red]✗[/red] {msg}")
             if failed:
                 for r in failed:
-                    print(f"  ✗ {r.error}")
+                    console.print(f"  [red]✗[/red] {r.error}")
+            all_ok = len(failed) == 0
+            console.print(Panel.fit(
+                Text.assemble(
+                    ("Done! ", "bold green" if all_ok else "bold yellow"),
+                    (f"{len(successful)}/{len(mp4_files)} converted", "white"),
+                )
+            ))
             return
         
         else:
@@ -1767,7 +1561,7 @@ Deprecated:
             if input_path.suffix.lower() == '.mp4' and (args.start == 0) and (args.end is None):
                 info = converter.get_video_info(input_path)
                 if not info or 'duration' not in info or info['duration'] is None:
-                    print("Unable to determine video duration. Aborting.")
+                    console.print("[red]Unable to determine video duration. Aborting.[/red]")
                     sys.exit(1)
                 if info['duration'] > 15:
                     selected_format = (args.format.lower() if args.format else _prompt_format())
@@ -1817,7 +1611,7 @@ Deprecated:
                         )
                         success_label = "GIF"
                 else:
-                    print("Video is 15 seconds or shorter. No processing needed.")
+                    console.print("[yellow]Video is 15 seconds or shorter. No processing needed.[/yellow]")
                     return
             else:
                 # Fallback to existing single-file conversion behavior
@@ -1854,37 +1648,34 @@ Deprecated:
                     success_label = "GIF"
             
             if result.success:
-                print(f"\n{success_label} created successfully: {result.output_path}")
-                
-                # Show file info
                 file_size_mb = result.output_path.stat().st_size / (1024 * 1024)
                 video_info = converter.get_video_info(input_path)
-                
-                print(f"File size: {file_size_mb:.1f}MB")
-                if video_info:
-                    print(f"Original video: {video_info['duration']:.1f}s, {video_info['size'][0]}x{video_info['size'][1]}")
-                
-                if result.source_deleted:
-                    print("✓ Source video file deleted successfully")
-                
-                # Print statistics
                 stats = converter._conversion_stats
-                print(f"\n=== Conversion Statistics ===")
-                print(f"Total conversions: {stats['total_conversions']}")
-                print(f"Successful: {stats['successful_conversions']}")
+
+                tbl = Table(show_header=False, box=None, padding=(0, 2))
+                tbl.add_row("[dim]Output[/dim]", str(result.output_path))
+                tbl.add_row("[dim]File size[/dim]", f"{file_size_mb:.1f} MB")
+                if video_info:
+                    tbl.add_row("[dim]Source[/dim]", f"{video_info['duration']:.1f}s  {video_info['size'][0]}×{video_info['size'][1]}")
+                if result.source_deleted:
+                    tbl.add_row("[dim]Source file[/dim]", "[green]deleted[/green]")
                 if stats['files_deleted'] > 0:
-                    print(f"Files deleted: {stats['files_deleted']}")
-                    print(f"Space saved: {stats['total_size_saved'] / (1024*1024):.1f}MB")
+                    tbl.add_row("[dim]Space saved[/dim]", f"{stats['total_size_saved'] / (1024*1024):.1f} MB")
+                console.print(Panel.fit(
+                    Text.assemble((f"{success_label} created successfully", "bold green")),
+                    subtitle=str(result.output_path.name),
+                ))
+                console.print(tbl)
             else:
                 fmt_label = (args.format or 'gif').upper()
-                print(f"Failed to convert video to {fmt_label}: {result.error}")
+                console.print(f"[red]Failed to convert to {fmt_label}:[/red] {result.error}")
                 sys.exit(1)
-    
+
     except KeyboardInterrupt:
-        print("\nConversion cancelled by user.")
+        console.print("\n[yellow]Conversion cancelled.[/yellow]")
         sys.exit(1)
     except Exception as e:
-        print(f"Error: {e}")
+        console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
 

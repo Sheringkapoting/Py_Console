@@ -75,12 +75,6 @@ except ImportError:
     _HAS_HEIC = False
 
 try:
-    import msvcrt
-    _HAS_MSVC = True
-except ImportError:
-    _HAS_MSVC = False
-
-try:
     import imagehash as _imagehash_mod
     _HAS_IMAGEHASH = True
 except ImportError:
@@ -160,19 +154,54 @@ _PHASH_THRESHOLD  = 8             # Hamming distance for perceptual dup
 _CACHE_FILE       = "_workflow_cache.json"
 _DUP_FOLDER       = "Duplicate"
 
-# ── ESC-key abort ─────────────────────────────────────────────────────────────
-_stop_event = threading.Event()
+# ── Shared utilities: TerminationManager (ESC) + dedup primitives ─────────────
+import sys as _sys_tmp
+_scripts_dir = str(Path(__file__).parent.parent / "src" / "scripts")
+_new_dir     = str(Path(__file__).parent)
+for _d in (_scripts_dir, _new_dir):
+    if _d not in _sys_tmp.path:
+        _sys_tmp.path.insert(0, _d)
 
-def _esc_listener() -> None:
-    try:
-        import msvcrt
-        while not _stop_event.is_set():
-            if msvcrt.kbhit() and msvcrt.getch() == b"\x1b":
-                _stop_event.set()
-                break
-            time.sleep(0.05)
-    except Exception:
-        pass
+from common_utils import TerminationManager as _TerminationManager
+_tm = _TerminationManager()
+_tm.start_monitoring()
+
+# Import pure dedup primitives from find_duplicates.py (same directory) to
+# avoid ~100 lines of duplicated union-find + hashing code.
+try:
+    from find_duplicates import _UF, _sha256, _dup_dest, _uf_to_groups
+except Exception:
+    class _UF:                                                 # type: ignore[no-redef]
+        def __init__(self, n):
+            self.parent = list(range(n)); self.rank = [0] * n
+        def find(self, x):
+            while self.parent[x] != x:
+                self.parent[x] = self.parent[self.parent[x]]; x = self.parent[x]
+            return x
+        def union(self, x, y):
+            rx, ry = self.find(x), self.find(y)
+            if rx == ry: return
+            if self.rank[rx] < self.rank[ry]: rx, ry = ry, rx
+            self.parent[ry] = rx
+            if self.rank[rx] == self.rank[ry]: self.rank[rx] += 1
+    def _sha256(p):                                            # type: ignore[no-redef]
+        try:
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""): h.update(chunk)
+            return h.hexdigest()
+        except OSError: return None
+    def _dup_dest(dup_dir, p):                                 # type: ignore[no-redef]
+        stem, suf = p.stem, p.suffix
+        c = dup_dir / f"{stem}_dup{suf}"; i = 1
+        while c.exists(): c = dup_dir / f"{stem}_dup{i}{suf}"; i += 1
+        return c
+    def _uf_to_groups(uf, n, images):                         # type: ignore[no-redef]
+        clusters: Dict[int, List[Path]] = defaultdict(list)
+        for i in range(n): clusters[uf.find(i)].append(images[i])
+        return [v for v in clusters.values() if len(v) > 1]
+
+del _sys_tmp, _scripts_dir, _new_dir, _d
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -553,40 +582,7 @@ def run_compression(src: Path) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 #  STAGE 3 · DEDUP  (SHA-256 + perceptual hash + face-embedding burst dedup)
 # ══════════════════════════════════════════════════════════════════════════════
-
-class _UF:
-    """Path-compressed union-find."""
-    def __init__(self, n: int) -> None:
-        self.parent = list(range(n))
-        self.rank   = [0] * n
-
-    def find(self, x: int) -> int:
-        while self.parent[x] != x:
-            self.parent[x] = self.parent[self.parent[x]]
-            x = self.parent[x]
-        return x
-
-    def union(self, x: int, y: int) -> None:
-        rx, ry = self.find(x), self.find(y)
-        if rx == ry:
-            return
-        if self.rank[rx] < self.rank[ry]:
-            rx, ry = ry, rx
-        self.parent[ry] = rx
-        if self.rank[rx] == self.rank[ry]:
-            self.rank[rx] += 1
-
-
-def _sha256(p: Path) -> Optional[str]:
-    try:
-        h = hashlib.sha256()
-        with open(p, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except OSError:
-        return None
-
+# _UF, _sha256, _dup_dest, _uf_to_groups imported from find_duplicates above.
 
 def _phash(p: Path) -> Optional[object]:
     if not _HAS_IMAGEHASH:
@@ -610,23 +606,6 @@ def _image_quality(p: Path) -> Tuple[int, int]:
 
 def _select_primary(group: List[Path]) -> Path:
     return min(group, key=lambda p: (-_image_quality(p)[0], _image_quality(p)[1]))
-
-
-def _dup_dest(dup_dir: Path, p: Path) -> Path:
-    stem, suffix = p.stem, p.suffix
-    candidate = dup_dir / f"{stem}_dup{suffix}"
-    n = 1
-    while candidate.exists():
-        candidate = dup_dir / f"{stem}_dup{n}{suffix}"
-        n += 1
-    return candidate
-
-
-def _uf_to_groups(uf: _UF, n: int, images: List[Path]) -> List[List[Path]]:
-    clusters: Dict[int, List[Path]] = defaultdict(list)
-    for i in range(n):
-        clusters[uf.find(i)].append(images[i])
-    return [v for v in clusters.values() if len(v) > 1]
 
 
 def run_dedup(
@@ -998,9 +977,6 @@ def run_face_sort(
     matches: List[dict] = []
     t0 = time.time()
 
-    _stop_event.clear()
-    esc_thread = threading.Thread(target=_esc_listener, daemon=True)
-    esc_thread.start()
     console.print("  [dim](ESC to abort)[/dim]\n")
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"),
@@ -1009,7 +985,7 @@ def run_face_sort(
                   console=console, refresh_per_second=6) as prog:
         task = prog.add_task("[cyan]Matching faces…[/cyan]", total=len(images))
         for img_path in images:
-            if _stop_event.is_set():
+            if _tm.is_terminating():
                 console.print("\n  [yellow]⚠  Aborted.[/yellow]")
                 break
             confirmed, fc = _match_face(img_path, face_app, refs, threshold, cache)
@@ -1053,7 +1029,6 @@ def run_face_sort(
             ))
             prog.advance(task)
 
-    _stop_event.set()
     elapsed = time.time() - t0
     n_matched = sum(1 for m in matches if m["folder"] and m["folder"] != "Group")
     n_group   = sum(1 for m in matches if m["folder"] == "Group")
@@ -1415,9 +1390,6 @@ def run_organizer(
 
     # ── Extract features ─────────────────────────────────────────────────────
     console.print(f"\n  Extracting features from {len(images)} images…")
-    _stop_event.clear()
-    esc_thread = threading.Thread(target=_esc_listener, daemon=True)
-    esc_thread.start()
     console.print("  [dim](ESC to abort)[/dim]")
 
     records: List[_ImgRec] = []
@@ -1428,7 +1400,7 @@ def run_organizer(
                   console=console) as prog:
         task = prog.add_task("Extracting…", total=len(images))
         for p in images:
-            if _stop_event.is_set():
+            if _tm.is_terminating():
                 console.print("\n  [yellow]⚠  Aborted.[/yellow]")
                 break
             rec = _extract_one(p, face_app, clip_model, clip_preprocess, clip_device, cache)
@@ -1438,7 +1410,6 @@ def run_organizer(
                 failed.append(p.name)
             prog.advance(task)
 
-    _stop_event.set()
     cache_save(cache, src)   # persist updated embeddings
 
     console.print(
