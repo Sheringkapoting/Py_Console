@@ -816,10 +816,7 @@ def main() -> None:
     # ── Extract features ──────────────────────────────────────────────────
     _console.rule("[bold cyan]3 / 5  Extracting features[/bold cyan]")
 
-    # Start ESC-key abort listener
-    _stop_event.clear()
-    esc_thread = threading.Thread(target=_esc_listener, daemon=True)
-    esc_thread.start()
+    # ESC-key abort listener is already running via _tm.start_monitoring() at import time
     _console.print("  [dim](Press [bold]ESC[/bold] at any time to abort and save progress)[/dim]")
 
     # Load embedding cache — skips ArcFace+CLIP inference for unchanged files
@@ -847,7 +844,7 @@ def main() -> None:
         ) as prog:
             task = prog.add_task("Extracting features", total=len(images))
             for p in images:
-                if _stop_event.is_set():
+                if _tm.is_terminating():
                     _console.print("\n  [yellow]⚠  ESC pressed — saving cache and stopping.[/yellow]")
                     break
                 try:
@@ -857,7 +854,7 @@ def main() -> None:
                 prog.advance(task)
     else:
         for i, p in enumerate(images, 1):
-            if _stop_event.is_set():
+            if _tm.is_terminating():
                 print("\n  ESC pressed — saving cache and stopping.")
                 break
             try:

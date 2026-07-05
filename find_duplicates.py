@@ -37,6 +37,15 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+# ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
+_scripts_dir = str(Path(__file__).parent / "src" / "scripts")
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+from common_utils import TerminationManager as _TerminationManager
+del _scripts_dir
+_tm = _TerminationManager()
+_tm.start_monitoring()
+
 # ── Dependency check ──────────────────────────────────────────────────────────
 
 def _check_deps() -> None:
@@ -284,6 +293,9 @@ def find_duplicate_groups(
     ) as prog:
         task = prog.add_task("[cyan]Hashing files[/cyan]", total=n)
         for i, p in enumerate(images):
+            if _tm.is_terminating():
+                console.print("\n  [yellow]⚠  ESC pressed — stopping.[/yellow]")
+                break
             h = _sha256(p)
             if h:
                 sha_map.setdefault(h, []).append(i)
@@ -320,6 +332,9 @@ def find_duplicate_groups(
     ) as prog:
         task = prog.add_task("[cyan]Computing pHash[/cyan]", total=n)
         for i, p in enumerate(images):
+            if _tm.is_terminating():
+                console.print("\n  [yellow]⚠  ESC pressed — stopping.[/yellow]")
+                break
             phashes[i] = _phash(p)
             prog.advance(task)
 

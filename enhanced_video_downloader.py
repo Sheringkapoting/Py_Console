@@ -15,7 +15,6 @@ import os
 import sys
 import re
 import json
-import signal
 import logging
 from urllib.parse import urljoin, urlparse, parse_qs
 from pathlib import Path
@@ -33,18 +32,14 @@ try:
 except ImportError:
     ANDROID_MODE = False
 
-# Cross-platform keyboard input detection
-try:
-    import msvcrt  # Windows
-    WINDOWS_PLATFORM = True
-except ImportError:
-    WINDOWS_PLATFORM = False
-    try:
-        import termios
-        import tty
-        import select
-    except ImportError:
-        pass
+# ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
+_scripts_dir = str(Path(__file__).parent / "src" / "scripts")
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+from common_utils import TerminationManager as _TerminationManager
+del _scripts_dir
+_tm = _TerminationManager()
+_tm.start_monitoring()
 
 try:
     import requests
@@ -67,25 +62,22 @@ class EnhancedVideoDownloader:
         self.output_dir = Path(output_dir)
         self.quality = quality
         self.gui_mode = gui_mode
-        self.terminated = False
         self.successful_downloads = 0
         self.failed_downloads = 0
         self.progress_bar = None
         self.current_status = ""
         self.android_mode = ANDROID_MODE
-        
+
         # Enhanced session configuration for bypassing restrictions
         self.session = requests.Session()
         self._setup_enhanced_session()
-        
+
         # Setup logging
         self.setup_logging()
         self.logger = logging.getLogger(__name__)
-        
-        # Setup keyboard monitoring for termination (skip on Android)
-        if not self.android_mode:
-            self.setup_keyboard_monitor()
-        
+
+        # ESC-key abort listener is already running via _tm.start_monitoring() at import time
+
         # Create output directory
         self.create_output_directory()
         
@@ -139,49 +131,6 @@ class EnhancedVideoDownloader:
         self.session.verify = False
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-    def setup_keyboard_monitor(self):
-        """Setup keyboard monitoring for graceful termination."""
-        def keyboard_monitor():
-            """Monitor keyboard input for termination signal."""
-            try:
-                if WINDOWS_PLATFORM:
-                    # Windows implementation
-                    while not self.terminated:
-                        if msvcrt.kbhit():
-                            key = msvcrt.getch()
-                            if key == b'\x1b':  # Escape key
-                                self.terminated = True
-                                print("\n⏹️  Termination requested by user (Escape key pressed)")
-                                break
-                        time.sleep(0.1)
-                else:
-                    # Unix-like systems implementation
-                    old_settings = None
-                    try:
-                        old_settings = termios.tcgetattr(sys.stdin)
-                        tty.setraw(sys.stdin.fileno())
-                        
-                        while not self.terminated:
-                            if select.select([sys.stdin], [], [], 0.1)[0]:
-                                key = sys.stdin.read(1)
-                                if key == '\x1b':  # Escape key
-                                    self.terminated = True
-                                    print("\n⏹️  Termination requested by user (Escape key pressed)")
-                                    break
-                    finally:
-                        if old_settings:
-                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-            except Exception as e:
-                self.logger.debug(f"Keyboard monitor error: {e}")
-        
-        # Start keyboard monitor in separate thread
-        monitor_thread = threading.Thread(target=keyboard_monitor, daemon=True)
-        monitor_thread.start()
-        
-        # Setup signal handlers as backup
-        signal.signal(signal.SIGINT, lambda s, f: setattr(self, 'terminated', True))
-        signal.signal(signal.SIGTERM, lambda s, f: setattr(self, 'terminated', True))
         
     def setup_logging(self):
         """Setup logging configuration."""
@@ -614,7 +563,7 @@ class EnhancedVideoDownloader:
                          disable=self.android_mode and not sys.stdout.isatty()) as pbar:
                     downloaded = 0
                     for chunk in response.iter_content(chunk_size=chunk_size):
-                        if self.terminated:
+                        if _tm.is_terminating():
                             return False
                         if chunk:
                             f.write(chunk)
@@ -629,7 +578,7 @@ class EnhancedVideoDownloader:
                 # No content-length header
                 downloaded = 0
                 for chunk in response.iter_content(chunk_size=chunk_size):
-                    if self.terminated:
+                    if _tm.is_terminating():
                         return False
                     if chunk:
                         f.write(chunk)
@@ -889,7 +838,7 @@ class EnhancedVideoDownloader:
             all_videos = []
             
             for i, url in enumerate(urls):
-                if self.terminated:
+                if _tm.is_terminating():
                     break
                     
                 try:
@@ -962,7 +911,7 @@ class EnhancedVideoDownloader:
             total = len(videos)
             
             for i, video in enumerate(videos):
-                if self.terminated:
+                if _tm.is_terminating():
                     break
                     
                 # Update progress
@@ -1037,7 +986,7 @@ class EnhancedVideoDownloader:
         print("Press Escape key to terminate gracefully\n")
         
         for i, video in enumerate(videos, 1):
-            if self.terminated:
+            if _tm.is_terminating():
                 break
                 
             title = video.get('title', 'video')
@@ -1153,7 +1102,7 @@ Examples:
                 
                 all_videos = []
                 for i, url in enumerate(urls, 1):
-                    if downloader.terminated:
+                    if _tm.is_terminating():
                         break
                         
                     print(f"\n📋 Analyzing URL ({i}/{len(urls)}): {url}")
@@ -1182,7 +1131,7 @@ Examples:
                 print("Press Escape key to terminate gracefully\n")
                 
                 for i, video in enumerate(all_videos, 1):
-                    if downloader.terminated:
+                    if _tm.is_terminating():
                         break
                         
                     title = video.get('title', 'video')
@@ -1215,7 +1164,7 @@ Examples:
             # Single URL CLI mode
             success = downloader.run_cli(args.url)
             
-            if downloader.terminated:
+            if _tm.is_terminating():
                 print("\n⏹️  Video download process was terminated by user")
                 sys.exit(0)
             elif not success:

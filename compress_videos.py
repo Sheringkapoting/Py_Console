@@ -38,12 +38,20 @@ import os
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
+_scripts_dir = str(Path(__file__).parent / "src" / "scripts")
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+from common_utils import TerminationManager as _TerminationManager
+del _scripts_dir
+_tm = _TerminationManager()
+_tm.start_monitoring()
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 
@@ -380,77 +388,12 @@ def compute_quality(orig: str, compressed: str, use_vmaf: bool) -> dict[str, flo
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Esc-key cancel monitor (Windows + POSIX, no double-import bug)
-# ══════════════════════════════════════════════════════════════════════════════
-
-try:
-    import msvcrt as _msvcrt
-    _IS_WINDOWS = True
-except ImportError:
-    _msvcrt    = None        # type: ignore[assignment]
-    _IS_WINDOWS = False
-
-try:
-    import select as _select
-    import termios as _termios
-    import tty as _tty
-    _HAS_POSIX_TTY = True
-except ImportError:
-    _HAS_POSIX_TTY = False
-
-
-class CancelMonitor:
-    """Background thread that sets an event when the user presses Esc."""
-
-    def __init__(self) -> None:
-        self.event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._old_term = None
-
-    def start(self) -> None:
-        target = self._poll_windows if _IS_WINDOWS else self._poll_posix
-        self._thread = threading.Thread(target=target, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self.event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=0.5)
-
-    def _poll_windows(self) -> None:
-        while not self.event.is_set():
-            if _msvcrt.kbhit() and _msvcrt.getch() == b"\x1b":
-                self.event.set()
-                break
-            time.sleep(0.05)
-
-    def _poll_posix(self) -> None:
-        if not sys.stdin.isatty() or not _HAS_POSIX_TTY:
-            return
-        fd = sys.stdin.fileno()
-        old = _termios.tcgetattr(fd)
-        try:
-            _tty.setcbreak(fd)
-            while not self.event.is_set():
-                if _select.select([sys.stdin], [], [], 0.1)[0]:
-                    if sys.stdin.read(1) == "\x1b":
-                        self.event.set()
-                        break
-        finally:
-            try:
-                _termios.tcsetattr(fd, _termios.TCSADRAIN, old)
-            except Exception:
-                pass
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Progress-aware FFmpeg runner
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_ffmpeg(
     cmd: list[str],
     duration_ms: Optional[int],
-    cancel: threading.Event,
     rich_progress: Progress,
     task_id,
 ) -> tuple[int, float]:
@@ -483,7 +426,7 @@ def run_ffmpeg(
             rich_progress.update(task_id, total=duration_ms, completed=0)
 
         while True:
-            if cancel.is_set():
+            if _tm.is_terminating():
                 _kill()
                 break
 
@@ -540,7 +483,6 @@ def compress_one(
     out_folder: Optional[Path],
     backup_folder: Optional[Path],
     use_vmaf: bool,
-    cancel: threading.Event,
     rich_progress: Progress,
     file_task_id,
 ) -> dict:
@@ -576,7 +518,7 @@ def compress_one(
     cmd          = build_encode_cmd(str(in_path), str(tmp), codec, encoder, is_hw, crf, preset)
     duration_ms  = probe_duration_ms(str(in_path))
 
-    rc, elapsed  = run_ffmpeg(cmd, duration_ms, cancel, rich_progress, file_task_id)
+    rc, elapsed  = run_ffmpeg(cmd, duration_ms, rich_progress, file_task_id)
     result["elapsed_s"] = round(elapsed, 2)
 
     if rc != 0 or not tmp.exists():
@@ -644,8 +586,6 @@ def run_batch(
     total   = len(paths)
     stats   = defaultdict(int)
     results = []
-    cancel  = CancelMonitor()
-    cancel.start()
 
     console.print()
     console.print(Rule("Compressing", style="cyan"))
@@ -671,7 +611,7 @@ def run_batch(
         file_task = progress.add_task("[dim]Waiting …[/dim]", total=None)
 
         for path in paths:
-            if cancel.event.is_set():
+            if _tm.is_terminating():
                 console.print("\n[red]  Cancelled (Esc pressed).[/red]")
                 break
 
@@ -694,7 +634,7 @@ def run_batch(
             res = compress_one(
                 path, codec, encoder, is_hw, crf, preset,
                 out_folder, backup_folder, use_vmaf,
-                cancel.event, progress, file_task,
+                progress, file_task,
             )
             results.append(res)
 
@@ -721,8 +661,6 @@ def run_batch(
                 console.print(f"  [red]✗[/red]  {fname[:45]}  {res['error']}")
 
             progress.advance(batch_task)
-
-    cancel.stop()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     console.print()

@@ -24,22 +24,14 @@ import shutil
 
 from tqdm import tqdm
 
-# Import shared utilities
-try:
-    from src.scripts.common_utils import format_size
-    _HAS_COMMON_UTILS = True
-except ImportError:
-    _HAS_COMMON_UTILS = False
-    def format_size(size_bytes: int) -> str:
-        if size_bytes == 0:
-            return "0B"
-        size_names = ("B", "KB", "MB", "GB", "TB")
-        i = 0
-        size = float(size_bytes)
-        while size >= 1024.0 and i < len(size_names) - 1:
-            size /= 1024.0
-            i += 1
-        return f"{size:.1f}{size_names[i]}"
+# ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
+_scripts_dir = str(Path(__file__).parent / "src" / "scripts")
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+from common_utils import format_size, TerminationManager as _TerminationManager
+del _scripts_dir
+_tm = _TerminationManager()
+_tm.start_monitoring()
 
 try:
     import imageio_ffmpeg
@@ -63,52 +55,6 @@ SUPPORTED_FORMATS = (
     ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv",
     ".webm", ".m4v", ".3gp", ".ogv", ".ts", ".mts"
 )
-
-# --- Termination Handler ---
-
-try:
-    import msvcrt
-except ImportError:
-    msvcrt = None
-
-
-class TerminationManager:
-    def __init__(self):
-        self._terminate = False
-        self._lock = threading.Lock()
-
-    def request_terminate(self):
-        with self._lock:
-            if not self._terminate:
-                self._terminate = True
-                print("\n[!] Termination requested by user (ESC). Stopping safely...")
-                logger.warning("Termination requested by user.")
-
-    def is_terminating(self):
-        with self._lock:
-            return self._terminate
-
-
-_termination = TerminationManager()
-
-
-def _monitor_esc():
-    """Monitor ESC key in a separate thread (Windows only)."""
-    if msvcrt is None:
-        return
-    while not _termination.is_terminating():
-        if msvcrt.kbhit():
-            ch = msvcrt.getch()
-            if ch == b"\x1b":  # ESC
-                _termination.request_terminate()
-                break
-        time.sleep(0.1)
-
-
-def start_esc_listener():
-    t = threading.Thread(target=_monitor_esc, daemon=True)
-    t.start()
-
 
 # --- ffprobe helpers ---
 
@@ -215,7 +161,7 @@ class VideoSegmenter:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Created output directory: {self.output_dir}")
 
-            if _termination.is_terminating():
+            if _tm.is_terminating():
                 return False
 
             # Get duration via ffmpeg
@@ -249,7 +195,7 @@ class VideoSegmenter:
 
     def segment_video(self, segment_idx: int, start: float, end: float) -> bool:
         """Create a video segment from start to end time with enhanced error handling."""
-        if _termination.is_terminating():
+        if _tm.is_terminating():
             return False
 
         output_filename = f"{self.input_path.stem}_segment_{segment_idx+1:03d}.mp4"
@@ -305,7 +251,7 @@ class VideoSegmenter:
                             pass
                     return False
                 
-                if _termination.is_terminating():
+                if _tm.is_terminating():
                     logger.info(f"Segment {segment_idx+1} creation aborted by user.")
                     process.terminate()
                     try:
@@ -336,7 +282,7 @@ class VideoSegmenter:
                 return False
 
             # Verify output file
-            if not _termination.is_terminating():
+            if not _tm.is_terminating():
                 if output_path.exists() and output_path.stat().st_size > 1024:  # At least 1KB
                     logger.info(f"Created segment {segment_idx+1}: {output_filename}")
                     return True
@@ -378,7 +324,7 @@ class VideoSegmenter:
 
     def run(self):
         """Main segmentation workflow with optimized progress tracking."""
-        start_esc_listener()
+        # ESC-key abort listener is already running via _tm.start_monitoring() at import time
         self._start_time = time.time()
 
         if not self.validate_input():
@@ -415,13 +361,13 @@ class VideoSegmenter:
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {}
             for i, (start, end) in enumerate(self.segments):
-                if _termination.is_terminating():
+                if _tm.is_terminating():
                     break
                 future = executor.submit(self.segment_video, i, start, end)
                 futures[future] = (i, start, end)
 
             for future in as_completed(futures):
-                if _termination.is_terminating():
+                if _tm.is_terminating():
                     executor.shutdown(wait=False, cancel_futures=True)
                     break
                 
@@ -435,7 +381,7 @@ class VideoSegmenter:
                         logger.warning(f"Segment {i+1} failed. Retrying (max {self.max_retries} times)...")
                         
                         retries = 0
-                        while retries < self.max_retries and not _termination.is_terminating():
+                        while retries < self.max_retries and not _tm.is_terminating():
                             wait_time = min(2 ** retries, 10)  # Exponential backoff
                             logger.info(f"Waiting {wait_time}s before retry {retries+1}/{self.max_retries}")
                             time.sleep(wait_time)
@@ -459,7 +405,7 @@ class VideoSegmenter:
                     logger.error(f"Exception in segmentation: {e}")
                     failed_segments += 1
 
-        if _termination.is_terminating():
+        if _tm.is_terminating():
             logger.info("Segmentation terminated by user.")
         else:
             self.progress_bar.n = 100

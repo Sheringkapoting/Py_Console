@@ -7,29 +7,14 @@ from pathlib import Path
 from PIL import Image, UnidentifiedImageError, ImageFile
 from tqdm import tqdm
 
-# Import shared utilities
-try:
-    from src.scripts.common_utils import format_size, TerminationManager
-    _HAS_COMMON_UTILS = True
-except ImportError:
-    _HAS_COMMON_UTILS = False
-    # Fallback format_size if common_utils not available
-    def format_size(size_bytes: int) -> str:
-        if size_bytes == 0:
-            return "0B"
-        size_names = ("B", "KB", "MB", "GB", "TB")
-        i = 0
-        size = float(size_bytes)
-        while size >= 1024.0 and i < len(size_names) - 1:
-            size /= 1024.0
-            i += 1
-        return f"{size:.1f}{size_names[i]}"
-
-try:
-    import msvcrt
-    _HAS_MSVC = True
-except Exception:
-    _HAS_MSVC = False
+# ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
+_scripts_dir = str(Path(__file__).parent / "src" / "scripts")
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+from common_utils import format_size, TerminationManager as _TerminationManager
+del _scripts_dir
+_tm = _TerminationManager()
+_tm.start_monitoring()
 
 # HEIC support
 try:
@@ -228,11 +213,9 @@ def convert_images(folder: str) -> None:
                 leave=True) as pbar:
         
         for file_path in total_candidates:
-            if _HAS_MSVC and msvcrt.kbhit():
-                key = msvcrt.getch()
-                if key == b'\x1b':  # ESC key
-                    print("\n[INFO] Conversion cancelled by user.")
-                    break
+            if _tm.is_terminating():
+                print("\n[INFO] Conversion cancelled by user.")
+                break
             
             file_start_time = time.time()
             original_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
@@ -372,11 +355,9 @@ def compress_jpgs(folder: str) -> None:
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
                     leave=True) as pbar:
             for file_path in jpgs:
-                if _HAS_MSVC and msvcrt.kbhit():
-                    key = msvcrt.getch()
-                    if key in (b"\x1b",):
-                        aborted = True
-                        break
+                if _tm.is_terminating():
+                    aborted = True
+                    break
                 
                 original_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
                 ok, err, replaced = compress_one_jpg(file_path)

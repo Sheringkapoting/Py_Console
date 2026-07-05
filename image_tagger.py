@@ -111,6 +111,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
+import sys as _sys_tmp
+_scripts_dir = str(Path(__file__).parent / "src" / "scripts")
+if _scripts_dir not in _sys_tmp.path:
+    _sys_tmp.path.insert(0, _scripts_dir)
+from common_utils import TerminationManager as _TerminationManager
+del _sys_tmp, _scripts_dir
+_tm = _TerminationManager()
+_tm.start_monitoring()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Dependency check  (runs before any heavy import)
@@ -874,6 +884,7 @@ def main() -> None:
     scope = "recursively" if args.recursive else "main folder only"
     console.print(Rule("Analysing images", style="cyan"))
     console.print(f"  [cyan]{len(all_images)}[/cyan] images  ({scope})\n")
+    console.print("  [dim](Press [bold]ESC[/bold] at any time to abort and save progress)[/dim]")
 
     # ── Tagging loop ─────────────────────────────────────────────────────────
     tagged: list[dict] = []
@@ -890,6 +901,9 @@ def main() -> None:
     ) as progress:
         task = progress.add_task("[cyan]Tagging …[/cyan]", total=len(all_images))
         for img_path in all_images:
+            if _tm.is_terminating():
+                console.print("\n  [yellow]⚠  ESC pressed — saving progress and stopping.[/yellow]")
+                break
             rec = tag_image(img_path, clip, pose, args.threshold, args.save_embeddings)
             tagged.append(rec)
             progress.advance(task)
