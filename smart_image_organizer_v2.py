@@ -24,8 +24,9 @@ related images sit together when sorted by name.
   ────────────
   python smart_image_organizer_v2.py \\
     --src "C:/Photos" --recursive \\
-    --models-root "C:/Users/Sunil/Downloads/Quick Share" \\
     --prefix album --cluster-threshold 0.48 --dry-run
+  # --models-root defaults to this repo's own directory (models/buffalo_l/);
+  # pass it explicitly only if your models live elsewhere.
 
   Install
   ───────
@@ -85,7 +86,9 @@ Image.MAX_IMAGE_PIXELS = 50_000_000
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
 MAX_BYTES   = 50 * 1024 * 1024
-_DEFAULT_MODELS_ROOT = r"C:\Users\Sunil\Downloads\Quick Share"
+# Default models root is this repo's own directory (contains models/buffalo_l/,
+# see models/CLAUDE.md). Override with --models-root if your models live elsewhere.
+_DEFAULT_MODELS_ROOT = str(Path(__file__).parent)
 _MAX_SIDE   = 1280   # cap longer edge before inference
 
 # ── Optional heavy dependencies ───────────────────────────────────────────

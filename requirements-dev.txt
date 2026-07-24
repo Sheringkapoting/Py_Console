@@ -1,0 +1,6 @@
+# Dev-only dependencies — testing the shared engine in src/scripts/.
+# Not needed to run any of the CLI tools themselves; see requirements.txt
+# and docs/dependencies.md for that.
+-r requirements.txt
+
+pytest>=7.4.0

@@ -13,3 +13,9 @@ assets/
 .vscode/
 .idea/
 node_modules/
+
+# Personal Claude Code settings — .claude/settings.json (checked in) holds
+# the shared baseline; this one is per-machine and grows from session to
+# session, so it shouldn't be committed even though the harness itself
+# also excludes it via a global excludesfile on some machines.
+.claude/settings.local.json

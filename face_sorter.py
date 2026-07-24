@@ -24,8 +24,12 @@ Usage:
 
 from __future__ import annotations
 
+import os
+
 # ── DEFAULTS  (overridden by CLI args or interactive prompts) ─────────────────
-_DEFAULT_MODELS_ROOT = r"C:\Users\Sunil\Downloads\Quick Share"
+# Default models root is this repo's own directory (contains models/buffalo_l/,
+# see models/CLAUDE.md). Override with --models if your models live elsewhere.
+_DEFAULT_MODELS_ROOT = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_THRESHOLD   = 0.40
 _DEFAULT_MIN_DET     = 0.65   # raised from 0.50 — rejects blurry/distant/background faces
 _IMAGE_EXTS          = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}

@@ -1,6 +1,15 @@
 # Consolidated Requirements for Py_Console tools
 # Derived from imports across all Python files in this repo.
-# Covers: enhanced_video_downloader.py, video_to_gif.py, secure_sort_by_known_faces.py, compress_videos.py, video_segmenter.py, convert_webp_to_jpg.py
+# Covers: enhanced_video_downloader.py, smart_video_converter.py, compress_videos.py,
+# video_segmenter.py, img_converter.py, find_duplicates.py, find_media_duplicates.py
+#
+# NOT covered here — separate, much heavier installs with their own setup
+# instructions in the script's own docstring and docs/dependencies.md:
+#   face_sorter.py              — insightface, onnxruntime (or onnxruntime-directml for GPU)
+#   image_tagger.py             — torch, transformers, mediapipe, opencv-python
+#   smart_image_organizer_v2.py — insightface, onnxruntime, torch, clip, opencv-python,
+#                                 scikit-learn (multi-signal clustering pulls in the same
+#                                 ML stack as the two scripts above)
 
 # Core downloader + scraping
 requests>=2.25.0
@@ -10,19 +19,22 @@ urllib3>=2.5.0
 
 # Progress/UI utilities
 tqdm>=4.65.0
+rich>=13.0.0
 
 # Video/GIF processing
-# Pin moviepy to <2.0 to keep moviepy.editor API used by video_to_gif.py
+# Pin moviepy to <2.0 to keep the moviepy.editor API used by smart_video_converter.py
+# and find_media_duplicates.py
 moviepy<2.0
 imageio>=2.19.0
 imageio-ffmpeg>=0.4.7
 numpy>=1.24.0
 Pillow>=10.0.0
 pillow-heif>=0.13.0
+ImageHash>=4.3.0
 
-# Face recognition utilities
-face-recognition>=1.3.0
-face-recognition-models>=0.3.0
+# Optional quality-of-life (scripts degrade gracefully if missing)
+psutil>=5.9.0
+send2trash>=1.8.0
 
 # Notes
 # - ffmpeg is provided via imageio-ffmpeg or system PATH.
