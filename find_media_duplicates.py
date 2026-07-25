@@ -26,6 +26,13 @@ Duplicates are moved to <src>/Duplicate/ and renamed {stem}_dup{N}{ext}, via
 the same shared engine (UI, progress bars, HTML report, ESC termination,
 move workflow) as find_duplicates.py — see src/scripts/dup_finder_core.py.
 
+Accepts 1–5 --src folders (repeat the flag); with more than one, duplicate
+detection runs across all of them combined — a file in one folder can be
+matched against a file in another. Collection, SHA-256 hashing, and
+signature computation run in parallel across files (video signature
+extraction is capped at a smaller worker count — moviepy/ffmpeg decoding
+isn't reliably thread-safe at full width).
+
 Requirements:
     pip install Pillow imagehash rich moviepy numpy
 
@@ -38,6 +45,7 @@ Usage:
     python find_media_duplicates.py --threshold 6                     # stricter (default 8)
     python find_media_duplicates.py --exact-only                      # skip perceptual pass
     python find_media_duplicates.py --recursive                       # include subfolders
+    python find_media_duplicates.py --src "D:\\Media" --src "E:\\Archive"  # combined, multi-folder
 
 Note: find_duplicates.py already scans .gif/.webp as static images (hashing
 only their first frame). Running both tools over the same folder means a
@@ -245,6 +253,12 @@ class VideoMediaHandler(dfc.MediaHandler):
     DURATION_TOLERANCE_SEC   = 2.0
     DURATION_TOLERANCE_RATIO = 0.05
 
+    # moviepy/ffmpeg-backed decoding isn't reliably safe at full thread-pool
+    # width — cap signature-pass concurrency well below the shared default
+    # (SHA-256 hashing of videos still runs at full width; only the
+    # decode-heavy signature step is throttled here).
+    signature_workers = 3
+
     def __init__(self) -> None:
         self._cache: dict[Path, Optional[_VideoSig]] = {}
 
@@ -345,8 +359,10 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("--src",         type=Path, default=None,
-                     help="Source media folder (prompted if omitted)")
+    ap.add_argument("--src",         type=Path, action="append", default=None,
+                     help="Source media folder — repeat for multiple (max "
+                          f"{dfc.MAX_SOURCES}), duplicates are then detected "
+                          "across all of them combined (prompted if omitted)")
     ap.add_argument("--media-type",  choices=["auto", "animated", "video"], default="auto",
                      help="Media family to scan: animated GIF/WebP, video, or both (default: auto = both)")
     ap.add_argument("--threshold",   type=int,  default=8,
@@ -372,19 +388,9 @@ def _report_path_for(args, handler: dfc.MediaHandler, both: bool) -> Optional[Pa
     return args.report.with_name(f"{args.report.stem}_{handler.report_slug.split('_', 1)[-1]}{args.report.suffix}")
 
 
-def _resolve_src(args) -> Path:
-    """Prompt for / validate the source folder once, shared across handlers."""
-    if args.src is None:
-        while True:
-            raw = dfc.Prompt.ask("  [cyan]Source folder[/cyan]").strip().strip('"').strip("'")
-            p = Path(raw)
-            if p.exists() and p.is_dir():
-                return p
-            console.print(f"    [red]✗  Not found:[/red] {p}")
-    if not args.src.exists() or not args.src.is_dir():
-        console.print(f"[red]  ✗  Source folder not found: {args.src}[/red]")
-        sys.exit(1)
-    return Path(args.src)
+def _resolve_srcs(args) -> list[Path]:
+    """Prompt for / validate the source folder(s) once, shared across handlers."""
+    return dfc.resolve_source_folders(args.src)
 
 
 def main() -> None:
@@ -407,9 +413,11 @@ def main() -> None:
         console.print("[red]  ✗  No media handlers available for the requested --media-type.[/red]")
         sys.exit(1)
 
-    # Resolve the source folder once (interactive prompt fires at most once,
-    # even when both handlers run back to back under --media-type auto).
-    args.src = _resolve_src(args)
+    # Resolve the source folder(s) once (interactive prompt fires at most
+    # once, even when both handlers run back to back under --media-type
+    # auto). run_workflow() re-validates but won't re-prompt since args.src
+    # is now already a resolved list.
+    args.src = _resolve_srcs(args)
 
     tm = dfc.make_termination_manager()
     both = len(handlers) > 1

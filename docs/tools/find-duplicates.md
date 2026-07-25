@@ -15,12 +15,12 @@ engine when that was extracted.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--src` | prompted | Source image folder |
+| `--src` | prompted | Source image folder — repeat for multiple (max 5). Duplicates are detected across all of them combined |
 | `--threshold` | `8` | Perceptual-hash Hamming distance (0–64). Lower = stricter |
 | `--recursive` | off | Include subfolders |
 | `--exact-only` | off | Skip the perceptual-hash pass — byte-identical only |
 | `--execute` | off | Move duplicates (default: dry run, no files moved) |
-| `--report` | `<src>/duplicate_report.html` | HTML report output path |
+| `--report` | `<first src>/duplicate_report.html` | HTML report output path |
 
 ## Examples
 
@@ -30,7 +30,25 @@ python find_duplicates.py --src "D:\Photos"             # dry run
 python find_duplicates.py --src "D:\Photos" --execute   # move duplicates
 python find_duplicates.py --threshold 6                 # stricter matching
 python find_duplicates.py --exact-only                  # skip perceptual pass
+
+# Multiple source folders — detects duplicates across all of them combined
+python find_duplicates.py --src "D:\Photos" --src "D:\Backup" --src "E:\Camera"
 ```
+
+## Multiple source folders
+
+Pass `--src` up to 5 times (or, when run interactively without `--src`,
+answer "yes" to "Add another source folder?" after each entry) to scan
+several folders as one combined pool — a file in folder A and a file in
+folder B can be detected as duplicates of each other, not just duplicates
+within their own folder. Collection and hashing/pHash computation run in
+parallel across files (and across folders, when collecting). Each
+duplicate is still moved into *its own* source folder's `Duplicate/` —
+never a shared one — so a single-folder run behaves exactly as before,
+and a multi-folder run keeps each folder's cleanup self-contained. The
+summary table and HTML report both gain a per-file/per-folder breakdown
+when more than one source is given; with a single `--src`, console and
+report output are unchanged.
 
 ## Notes
 

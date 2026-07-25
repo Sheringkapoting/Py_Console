@@ -11,7 +11,13 @@ Primary image selection per group:
   1. Highest pixel count  (width × height)   ← best quality
   2. Smallest file size   (tiebreaker)        ← most efficient encoding
 
-Duplicates are moved to  <src>/Duplicate/  and renamed  {stem}_dup{N}{ext}.
+Duplicates are moved to each file's own <src>/Duplicate/ and renamed
+{stem}_dup{N}{ext}.
+
+Accepts 1–5 --src folders (repeat the flag); with more than one, duplicate
+detection runs across all of them combined — a file in one folder can be
+matched against a file in another. Collection and hashing/pHash
+computation run in parallel across files (and across folders).
 
 Requirements:
     pip install Pillow imagehash rich tqdm
@@ -23,19 +29,22 @@ Usage:
     python find_duplicates.py --threshold 6                # stricter (default 8)
     python find_duplicates.py --exact-only                 # skip perceptual pass
     python find_duplicates.py --recursive                  # include subfolders
+    python find_duplicates.py --src "D:\\Photos" --src "E:\\Backup"  # combined, multi-folder
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures as cf
 import hashlib
 import io
 import os
 import shutil
 import sys
+from collections import Counter
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 # ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
 _scripts_dir = str(Path(__file__).parent / "src" / "scripts")
@@ -87,6 +96,7 @@ console = Console()
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
 _DUPLICATE_FOLDER = "Duplicate"
 _THUMB = 160          # thumbnail px for HTML report
+_MAX_SOURCES = 5      # max source folders accepted per run
 
 # Watermark detection tunables (cross-image diff approach)
 _WM_DIFF_THRESH = 20    # min per-pixel diff to count as "changed" region
@@ -163,6 +173,85 @@ def collect_images(src: Path, recursive: bool) -> list[Path]:
         and p.suffix.lower() in _IMAGE_EXTS
         and _DUPLICATE_FOLDER not in p.relative_to(src).parts
     )
+
+
+def collect_from_sources(
+    srcs: list[Path],
+    recursive: bool,
+) -> tuple[list[Path], dict[Path, Path]]:
+    """
+    Collect images from every source folder combined. With more than one
+    source, each folder's collect_images() call is independent I/O and runs
+    concurrently. Returns (items, item_src), where item_src maps each file
+    back to the source-folder root it came from (used to route moved
+    duplicates back to *their own* folder's Duplicate/, and to label
+    folders in the summary/report).
+
+    Files that resolve to the same on-disk path from more than one source
+    (overlapping or nested folders) are only counted once, so the exact-hash
+    pass never sees a file "duplicate itself".
+    """
+    if len(srcs) == 1:
+        per_src = {srcs[0]: collect_images(srcs[0], recursive)}
+    else:
+        per_src = {}
+        with cf.ThreadPoolExecutor(max_workers=min(len(srcs), _default_workers())) as ex:
+            futures = {ex.submit(collect_images, s, recursive): s for s in srcs}
+            for fut, s in futures.items():
+                per_src[s] = fut.result()
+
+    items: list[Path] = []
+    item_src: dict[Path, Path] = {}
+    seen: set[Path] = set()
+    for s in srcs:
+        for p in per_src.get(s, []):
+            resolved = p.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            items.append(p)
+            item_src[p] = s
+    return items, item_src
+
+
+# ── Parallel execution helper ─────────────────────────────────────────────────
+
+def _default_workers() -> int:
+    return min(32, (os.cpu_count() or 4) + 4)
+
+
+def _parallel_compute(
+    items: list,
+    fn,
+    tm: _TerminationManager,
+    prog: Progress,
+    task,
+    max_workers: Optional[int] = None,
+) -> list:
+    """
+    Run fn(item) for every item on a thread pool, advancing prog/task once
+    per completion, returning results in the same order as `items`.
+
+    Threads (not processes) because per-file work here is dominated by
+    file I/O and native (GIL-releasing) PIL/imagehash code, not by pickling
+    -friendly CPU-bound Python. On ESC (tm.is_terminating()), stops waiting
+    on stragglers and cancels whatever hasn't started yet.
+    """
+    results: list = [None] * len(items)
+    if not items:
+        return results
+    with cf.ThreadPoolExecutor(max_workers=max_workers or _default_workers()) as ex:
+        futures = {ex.submit(fn, item): i for i, item in enumerate(items)}
+        try:
+            for fut in cf.as_completed(futures):
+                if tm.is_terminating():
+                    break
+                results[futures[fut]] = fut.result()
+                prog.advance(task)
+        finally:
+            for fut in futures:
+                fut.cancel()
+    return results
 
 
 # ── Watermark detection ───────────────────────────────────────────────────────
@@ -292,14 +381,13 @@ def find_duplicate_groups(
         console=console,
     ) as prog:
         task = prog.add_task("[cyan]Hashing files[/cyan]", total=n)
-        for i, p in enumerate(images):
-            if _tm.is_terminating():
-                console.print("\n  [yellow]⚠  ESC pressed — stopping.[/yellow]")
-                break
-            h = _sha256(p)
-            if h:
-                sha_map.setdefault(h, []).append(i)
-            prog.advance(task)
+        hashes = _parallel_compute(images, _sha256, _tm, prog, task)
+    if _tm.is_terminating():
+        console.print("\n  [yellow]⚠  ESC pressed — stopping.[/yellow]")
+
+    for i, h in enumerate(hashes):
+        if h:
+            sha_map.setdefault(h, []).append(i)
 
     n_exact_groups = 0
     for idxs in sha_map.values():
@@ -319,8 +407,6 @@ def find_duplicate_groups(
     console.print(Rule("Pass 2 / Perceptual hash near-match", style="cyan"))
     console.print(f"  [dim]Hamming threshold: {threshold} / 64 bits[/dim]\n")
 
-    phashes: list[Optional[imagehash.ImageHash]] = [None] * n
-
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -331,12 +417,9 @@ def find_duplicate_groups(
         console=console,
     ) as prog:
         task = prog.add_task("[cyan]Computing pHash[/cyan]", total=n)
-        for i, p in enumerate(images):
-            if _tm.is_terminating():
-                console.print("\n  [yellow]⚠  ESC pressed — stopping.[/yellow]")
-                break
-            phashes[i] = _phash(p)
-            prog.advance(task)
+        phashes = _parallel_compute(images, _phash, _tm, prog, task)
+    if _tm.is_terminating():
+        console.print("\n  [yellow]⚠  ESC pressed — stopping.[/yellow]")
 
     # Compare all pairs — O(N²) but each op is a fast 64-bit XOR popcount.
     # Bucket by first 2 hex chars of hash to reduce comparisons by ~256×.
@@ -428,9 +511,19 @@ def write_html_report(
     threshold: int,
     dry_run: bool,
     recursive: bool,
-    src: Path,
+    src: Union[Path, list[Path]],
+    item_src: Optional[dict[Path, Path]] = None,
 ) -> None:
-    """Generate dark-theme HTML report with Exact and Near-match sections."""
+    """
+    Generate dark-theme HTML report with Exact and Near-match sections.
+
+    `src` accepts either a single Path (original, single-folder behavior)
+    or a list of Paths (combined multi-folder run). When multiple sources
+    are given, pass `item_src` (path -> owning source root, as returned by
+    collect_from_sources()) to label each card with its originating folder
+    and add a per-folder breakdown section.
+    """
+    srcs = list(src) if isinstance(src, (list, tuple)) else [src]
 
     exact_groups = [g for g in groups if g["match_type"] == "exact"]
     near_groups  = [g for g in groups if g["match_type"] == "near"]
@@ -455,12 +548,18 @@ def write_html_report(
         label       = "PRIMARY" if is_primary else "DUP"
         badge_bg    = "#00c853" if is_primary else "#d32f2f"
         border_col  = "#00e676" if is_primary else "#ff5252"
+        folder_tag  = ""
+        if item_src and len(srcs) > 1:
+            root = item_src.get(p)
+            if root is not None:
+                folder_tag = f'<div class="ffolder">{root.name or str(root)}</div>'
         return (
             f'<div class="card">'
             f'<span class="badge" style="background:{badge_bg}">{label}</span>'
             f'<img src="{img_src}" title="{p.name}" '
             f'     style="border:2px solid {border_col}">'
             f'<div class="fname">{p.name}</div>'
+            f'{folder_tag}'
             f'<div class="fmeta">{w}×{h} · {size_kb:.1f} KB</div>'
             f'</div>'
         )
@@ -492,6 +591,33 @@ def write_html_report(
         f"🔍 Near Duplicates (Hamming ≤ {threshold})", near_groups, "#ce93d8"
     )
 
+    multi_source = len(srcs) > 1
+    if multi_source:
+        source_heading = f"Sources ({len(srcs)})"
+        source_lines    = "<br>".join(f"&nbsp;&nbsp;{s}" for s in srcs)
+        source_value    = f"<br>{source_lines}"
+    else:
+        source_heading = "Source"
+        source_value   = str(srcs[0])
+
+    folder_sec = ""
+    if multi_source and item_src:
+        counts: dict[Path, int] = {s: 0 for s in srcs}
+        for g in groups:
+            for p in g["paths"]:
+                root = item_src.get(p)
+                if root in counts:
+                    counts[root] += 1
+        rows = "".join(f'<tr><td>{s}</td><td>{counts[s]}</td></tr>' for s in srcs)
+        folder_sec = (
+            '<section>'
+            '<h2 style="color:#8ab4f8">📁 Per-folder breakdown'
+            '  <span class="count">files involved in duplicate groups, by source</span>'
+            '</h2>'
+            f'<table class="folders">{rows}</table>'
+            '</section>'
+        )
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -518,12 +644,16 @@ def write_html_report(
     .fname  {{ font-size:9px; color:#aaa; max-width:{_THUMB}px;
                word-break:break-all; margin-top:4px }}
     .fmeta  {{ font-size:9px; color:#4fc; margin-top:2px }}
+    .ffolder {{ font-size:9px; color:#8ab4f8; margin-top:2px }}
+    table.folders {{ width:100%; border-collapse:collapse; font-size:.85rem }}
+    table.folders td {{ padding:4px 8px; border-bottom:1px solid #2a2a3f }}
+    table.folders td:last-child {{ text-align:right; color:#4fc }}
   </style>
 </head>
 <body>
   <h1>🗂 Duplicate Image Finder Report</h1>
   <p class="meta">
-    Source: {src}<br>
+    {source_heading}: {source_value}<br>
     Mode: <span class="mode">{mode_label}</span><br>
     Threshold: {threshold} / 64 bits &nbsp;|&nbsp;
     Recursive: {'yes' if recursive else 'no'} &nbsp;|&nbsp;
@@ -532,6 +662,7 @@ def write_html_report(
     Exact: {total_exact} &nbsp;|&nbsp;
     Near: {total_near}
   </p>
+  {folder_sec}
   {exact_sec}
   {near_sec}
 </body>
@@ -548,8 +679,10 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("--src",        type=Path,  default=None,
-                    help="Source image folder (prompted if omitted)")
+    ap.add_argument("--src",        type=Path,  action="append", default=None,
+                    help=f"Source image folder — repeat for multiple (max {_MAX_SOURCES}), "
+                         "duplicates are then detected across all of them combined "
+                         "(prompted if omitted)")
     ap.add_argument("--threshold",  type=int,   default=8,
                     help="Perceptual hash Hamming distance 0–64 (default 8). Lower = stricter.")
     ap.add_argument("--recursive",  action="store_true",
@@ -561,6 +694,51 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--report",     type=Path,  default=None,
                     help="HTML report output path (default: <src>/duplicate_report.html)")
     return ap
+
+
+def _resolve_sources(src_arg: Optional[list[Path]]) -> list[Path]:
+    """
+    Normalize --src into a validated list of 1..._MAX_SOURCES existing
+    directories. None -> interactive prompt loop (capped at _MAX_SOURCES);
+    a list (from repeated --src) -> validated, deduped by resolved path,
+    and capped.
+    """
+    if src_arg is None:
+        srcs: list[Path] = []
+        while True:
+            label = f"Source folder {len(srcs) + 1}/{_MAX_SOURCES}" if srcs else "Source folder"
+            raw = Prompt.ask(f"  [cyan]{label}[/cyan]").strip().strip('"').strip("'")
+            p = Path(raw)
+            if not (p.exists() and p.is_dir()):
+                console.print(f"    [red]✗  Not found:[/red] {p}")
+                continue
+            if any(p.resolve() == s.resolve() for s in srcs):
+                console.print(f"    [yellow]⚠  Already added:[/yellow] {p}")
+                continue
+            srcs.append(p)
+            if len(srcs) >= _MAX_SOURCES:
+                console.print(f"  [dim]Maximum of {_MAX_SOURCES} source folders reached.[/dim]")
+                break
+            if not Confirm.ask("  Add another source folder?", default=False):
+                break
+        return srcs
+
+    if len(src_arg) > _MAX_SOURCES:
+        console.print(f"[red]  ✗  Too many source folders ({len(src_arg)}); max {_MAX_SOURCES}.[/red]")
+        sys.exit(1)
+
+    srcs = []
+    seen: set[Path] = set()
+    for p in src_arg:
+        if not p.exists() or not p.is_dir():
+            console.print(f"[red]  ✗  Source folder not found: {p}[/red]")
+            sys.exit(1)
+        resolved = p.resolve()
+        if resolved in seen:
+            continue   # same folder passed twice — dedupe silently
+        seen.add(resolved)
+        srcs.append(p)
+    return srcs
 
 
 def main() -> None:
@@ -581,25 +759,19 @@ def main() -> None:
     ))
     console.print()
 
-    # ── Source folder ────────────────────────────────────────────────────
-    if args.src is None:
-        while True:
-            raw = Prompt.ask("  [cyan]Source folder[/cyan]").strip().strip('"').strip("'")
-            p   = Path(raw)
-            if p.exists() and p.is_dir():
-                args.src = p
-                break
-            console.print(f"    [red]✗  Not found:[/red] {p}")
-    else:
-        if not args.src.exists() or not args.src.is_dir():
-            console.print(f"[red]  ✗  Source folder not found: {args.src}[/red]")
-            sys.exit(1)
+    # ── Source folder(s) ─────────────────────────────────────────────────
+    srcs = _resolve_sources(args.src)
+    multi_source = len(srcs) > 1
 
-    src     = Path(args.src)
     dry_run = not args.execute
-    report  = args.report if args.report else src / "duplicate_report.html"
+    report  = args.report if args.report else srcs[0] / "duplicate_report.html"
 
-    console.print(f"  [cyan]Source     [/cyan] : {src}")
+    if multi_source:
+        console.print(f"  [cyan]Sources ({len(srcs)})[/cyan] :")
+        for i, s in enumerate(srcs, 1):
+            console.print(f"                   {i}. {s}")
+    else:
+        console.print(f"  [cyan]Source     [/cyan] : {srcs[0]}")
     console.print(f"  [cyan]Mode       [/cyan] : [bold {'yellow' if dry_run else 'red'}]"
                   f"{'DRY RUN — no files moved' if dry_run else 'EXECUTE — files will be moved'}[/bold "
                   f"{'yellow' if dry_run else 'red'}]")
@@ -609,13 +781,21 @@ def main() -> None:
     console.print(f"  [cyan]Report     [/cyan] : {report}")
     console.print()
 
-    # ── Collect ──────────────────────────────────────────────────────────
+    # ── Collect (combined across all sources) ────────────────────────────
     console.print(Rule("Collecting images", style="cyan"))
-    images = collect_images(src, args.recursive)
+    images, item_src = collect_from_sources(srcs, args.recursive)
     if not images:
-        console.print(f"[yellow]  ⚠  No images found in: {src}[/yellow]")
+        where = str(srcs[0]) if not multi_source else f"any of the {len(srcs)} source folders"
+        console.print(f"[yellow]  ⚠  No images found in: {where}[/yellow]")
         sys.exit(0)
-    console.print(f"  [cyan]{len(images)}[/cyan] images found\n")
+    if multi_source:
+        per_folder = Counter(item_src[p] for p in images)
+        console.print(f"  [cyan]{len(images)}[/cyan] images found across {len(srcs)} folders (combined):")
+        for s in srcs:
+            console.print(f"    [dim]{per_folder.get(s, 0):>6}[/dim]  {s}")
+        console.print()
+    else:
+        console.print(f"  [cyan]{len(images)}[/cyan] images found\n")
 
     # ── Detect ───────────────────────────────────────────────────────────
     groups = find_duplicate_groups(images, args.threshold, args.exact_only)
@@ -638,6 +818,8 @@ def main() -> None:
         min_width=78,
     )
     table.add_column("Primary (keep)",  style="green",   max_width=36)
+    if multi_source:
+        table.add_column("Folder",      style="blue",    max_width=20)
     table.add_column("Type",            style="cyan",    justify="center")
     table.add_column("Copies",          justify="right", style="bold white")
     table.add_column("Resolution",      justify="right", style="yellow")
@@ -657,13 +839,17 @@ def main() -> None:
         except Exception:
             pass
         type_label = "[cyan]exact[/cyan]" if mtype == "exact" else "[magenta]near[/magenta]"
-        table.add_row(
-            primary.name,
+        row = [primary.name]
+        if multi_source:
+            root = item_src.get(primary)
+            row.append((root.name or str(root)) if root else "—")
+        row += [
             type_label,
             str(len(dups)),
             f"{w}×{h}" if w else "—",
             f"{size/1024:.1f} KB",
-        )
+        ]
+        table.add_row(*row)
 
     console.print(table)
     console.print(
@@ -676,7 +862,8 @@ def main() -> None:
     if dry_run:
         # Generate report from current (pre-move) paths
         console.print(f"  [dim]Generating HTML report …[/dim]")
-        write_html_report(groups, report, args.threshold, True, args.recursive, src)
+        write_html_report(groups, report, args.threshold, True, args.recursive,
+                           srcs if multi_source else srcs[0], item_src)
         console.print(f"  [green]✓[/green]  Report → [link={report.as_uri()}]{report}[/link]\n")
 
         console.print(Panel.fit(
@@ -695,9 +882,15 @@ def main() -> None:
         dry_run = False
 
     # ── Move duplicates ──────────────────────────────────────────────────
+    # Each duplicate moves into *its own* source folder's Duplicate/ — not a
+    # single shared one — so single-folder behavior is unchanged and a
+    # multi-folder run still leaves each folder's cleanup self-contained.
     console.print(Rule("Moving duplicates", style="cyan"))
-    dup_dir = src / _DUPLICATE_FOLDER
-    dup_dir.mkdir(exist_ok=True)
+    dup_dirs: dict[Path, Path] = {}
+    for s in srcs:
+        d = s / _DUPLICATE_FOLDER
+        d.mkdir(exist_ok=True)
+        dup_dirs[s] = d
 
     moved = errors = 0
     dest_map: dict[Path, Path] = {}   # original_path → moved_path (for report)
@@ -717,10 +910,12 @@ def main() -> None:
             for dup in group:
                 if dup == primary:
                     continue
-                dest = _dup_dest(dup_dir, dup)
+                dup_root = item_src.get(dup, srcs[0])
+                dest = _dup_dest(dup_dirs[dup_root], dup)
                 try:
                     shutil.move(str(dup), str(dest))
                     dest_map[dup] = dest
+                    item_src[dest] = dup_root
                     moved += 1
                 except Exception as exc:
                     console.print(f"  [red]ERR[/red]  {dup.name}: {exc}")
@@ -731,13 +926,20 @@ def main() -> None:
     for g_info in groups:
         g_info["paths"] = [dest_map.get(p, p) for p in g_info["paths"]]
 
-    console.print(
-        f"\n  [green]✓[/green]  {moved} duplicates moved to [cyan]{dup_dir}[/cyan]  ·  {errors} errors\n"
-    )
+    if multi_source:
+        console.print(
+            f"\n  [green]✓[/green]  {moved} duplicates moved to each source's "
+            f"[cyan]{_DUPLICATE_FOLDER}/[/cyan] folder  ·  {errors} errors\n"
+        )
+    else:
+        console.print(
+            f"\n  [green]✓[/green]  {moved} duplicates moved to [cyan]{dup_dirs[srcs[0]]}[/cyan]  ·  {errors} errors\n"
+        )
 
     # ── HTML report ──────────────────────────────────────────────────────
     console.print(f"  [dim]Generating HTML report …[/dim]")
-    write_html_report(groups, report, args.threshold, False, args.recursive, src)
+    write_html_report(groups, report, args.threshold, False, args.recursive,
+                       srcs if multi_source else srcs[0], item_src)
     console.print(f"  [green]✓[/green]  Report → [link={report.as_uri()}]{report}[/link]\n")
 
     console.print(Panel.fit(
