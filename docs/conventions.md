@@ -23,21 +23,25 @@ A background thread polls for the ESC key (`msvcrt` on Windows, `termios`/
 being present in every tool in this repo. If you add a new tool or a new
 long-running loop to an existing one, wire this up the same way.
 
-## Common but not universal: Rich UI
+## Rich UI
 
-7 of 10 files use `rich` for console output — `Console`, `Panel`, `Rule`,
+All 10 files use `rich` for console output — `Console`, `Panel`, `Rule`,
 `Table`, `Progress` with a consistent column set (spinner, bar, count,
 elapsed/remaining time), `Prompt`/`Confirm` for interactive input:
 `compress_videos.py`, `face_sorter.py`, `find_duplicates.py`,
 `image_tagger.py`, `smart_image_organizer_v2.py`, `smart_video_converter.py`,
+`enhanced_video_downloader.py`, `img_converter.py`, `video_segmenter.py`,
 and the shared `src/scripts/dup_finder_core.py`. Tools built on
 `dup_finder_core.py` (currently just `find_media_duplicates.py`) get this
 UI for free via `run_workflow()`.
 
-The remaining tools (`enhanced_video_downloader.py`, `img_converter.py`,
-`video_segmenter.py`) use plain `tqdm` bars or plain `print`/`input()`
-instead. Match whichever pattern the tool you're editing already uses —
-don't mix the two within one file.
+`enhanced_video_downloader.py` and `video_segmenter.py` also configure
+`logging.basicConfig()` with a file handler for internal/debug detail.
+Neither attaches a `StreamHandler(sys.stdout)` — a `rich.progress.Progress`
+is a live display, and log lines writing to stdout underneath it will tear
+the bar apart. If you add stdout logging to a tool that also runs a
+`Progress`, route it through `console.print` (or a `RichHandler(console=
+console)`) instead, never a bare stdout `StreamHandler`.
 
 ## Destructive-action safety: varies by tool, know which one you're in
 

@@ -17,12 +17,9 @@ from pathlib import Path
 from typing import List, Tuple
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 import gc
 import subprocess
 import shutil
-
-from tqdm import tqdm
 
 # ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
 _scripts_dir = str(Path(__file__).parent / "src" / "scripts")
@@ -33,20 +30,40 @@ del _scripts_dir
 _tm = _TerminationManager()
 _tm.start_monitoring()
 
-try:
-    import imageio_ffmpeg
-except ImportError as e:
-    print(f"Error importing dependencies: {e}")
-    sys.exit(1)
+# ── Dependency check ──────────────────────────────────────────────────────────
 
-# Configure logging
+def _importable(name: str) -> bool:
+    try: __import__(name); return True
+    except ImportError: return False
+
+def _check_deps() -> None:
+    missing = [pkg for pkg, mod in [("rich", "rich"), ("imageio-ffmpeg", "imageio_ffmpeg")]
+               if not _importable(mod)]
+    if missing:
+        print(f"\n  ✗  Run:  pip install {' '.join(missing)}\n")
+        sys.exit(1)
+
+_check_deps()
+
+# ── Imports (after dep-check) ─────────────────────────────────────────────────
+
+import imageio_ffmpeg
+from rich.console import Console
+from rich.rule import Rule
+from rich.table import Table
+from rich.progress import (
+    BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
+    TextColumn, TimeElapsedColumn, TimeRemainingColumn,
+)
+
+console = Console()
+
+# Configure logging — file only. A rich Progress live display owns stdout
+# while segmenting runs; a stdout StreamHandler would tear the bar apart.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("video_segmenter.log"),
-        logging.StreamHandler()
-    ],
+    handlers=[logging.FileHandler("video_segmenter.log")],
 )
 logger = logging.getLogger("VideoSegmenter")
 
@@ -119,10 +136,6 @@ class VideoSegmenter:
         self.duration = 0.0
         self.segments: List[Tuple[float, float]] = []
 
-        # Progress tracking
-        self.progress_bar = None
-        self.progress_lock = threading.Lock()
-        self.frames_processed = 0
         self._start_time = None
 
     def validate_input(self) -> bool:
@@ -133,26 +146,6 @@ class VideoSegmenter:
             logger.error(f"Unsupported video format: {self.input_path.suffix}")
             return False
         return True
-
-    def update_progress(self, segment_idx: int, total_segments: int):
-        """Update progress bar with enhanced metrics."""
-        with self.progress_lock:
-            if self.progress_bar and total_segments > 0:
-                progress = min(100, int(((segment_idx + 1) / total_segments) * 100))
-                self.progress_bar.n = progress
-                
-                # Enhanced postfix with detailed metrics
-                elapsed = time.time() - self._start_time if self._start_time else 0
-                rate = (segment_idx + 1) / elapsed if elapsed > 0 else 0
-                eta = (total_segments - segment_idx - 1) / rate if rate > 0 else 0
-                
-                postfix_dict = {
-                    'seg': f"{segment_idx+1}/{total_segments}",
-                    'eta': f"{eta:.0f}s"
-                }
-                
-                self.progress_bar.set_postfix(postfix_dict, refresh=False)
-                self.progress_bar.refresh()
 
     def analyze_video(self) -> bool:
         """Determine video duration and compute segment time ranges."""
@@ -184,10 +177,7 @@ class VideoSegmenter:
             logger.info(f"Calculated {len(self.segments)} segments")
             logger.info(f"  - Segment duration: {self.segment_duration}s")
             logger.info(f"  - Gap between segments: {self.segment_gap}s")
-            
-            if self.progress_bar:
-                self.progress_bar.n = 5
-                self.progress_bar.refresh()
+
             return True
         except Exception as e:
             logger.error(f"Error analyzing video: {e}")
@@ -323,33 +313,31 @@ class VideoSegmenter:
         pass  # Memory management not critical for stream-copy segmentation
 
     def run(self):
-        """Main segmentation workflow with optimized progress tracking."""
+        """Main segmentation workflow."""
         # ESC-key abort listener is already running via _tm.start_monitoring() at import time
         self._start_time = time.time()
 
         if not self.validate_input():
+            console.print(f"[red]  ✗  Invalid input: {self.input_path}[/red]")
             return
 
-        # Optimized progress bar initialization
-        self.progress_bar = tqdm(
-            total=100,
-            desc="Segmenting",
-            unit="%",
-            bar_format='{desc}: {percentage:3.0f}% |{bar}| [{elapsed}<{remaining}] {postfix}',
-            dynamic_ncols=True,
-            mininterval=0.15
-        )
+        console.print()
+        console.print(Rule("Analyzing", style="cyan"))
 
         if not self.analyze_video():
-            self.progress_bar.close()
+            console.print("[red]  ✗  Failed to analyze video.[/red]")
             return
 
         if not self.segments:
-            logger.warning("No segments to process.")
-            self.progress_bar.close()
+            console.print("[yellow]  ⚠  No segments to process.[/yellow]")
             return
 
         total_segments = len(self.segments)
+        console.print(
+            f"[dim]Duration:[/dim] {self.duration:.1f}s   "
+            f"[dim]Segments:[/dim] {total_segments}   "
+            f"[dim]Workers:[/dim] {self.max_workers}"
+        )
         logger.info(
             f"Starting segmentation of {total_segments} segments "
             f"with {self.max_workers} workers"
@@ -357,71 +345,98 @@ class VideoSegmenter:
 
         successful_segments = 0
         failed_segments = 0
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {}
-            for i, (start, end) in enumerate(self.segments):
-                if _tm.is_terminating():
-                    break
-                future = executor.submit(self.segment_video, i, start, end)
-                futures[future] = (i, start, end)
 
-            for future in as_completed(futures):
-                if _tm.is_terminating():
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
-                
-                try:
-                    success = future.result()
-                    if success:
-                        successful_segments += 1
-                    else:
+        console.print()
+        console.print(Rule("Segmenting", style="cyan"))
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=28),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=6,
+        ) as progress:
+            task = progress.add_task("[cyan]Segments[/cyan]", total=total_segments)
+
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {}
+                for i, (start, end) in enumerate(self.segments):
+                    if _tm.is_terminating():
+                        break
+                    future = executor.submit(self.segment_video, i, start, end)
+                    futures[future] = (i, start, end)
+
+                for future in as_completed(futures):
+                    if _tm.is_terminating():
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+
+                    i, start, end = futures[future]
+                    try:
+                        success = future.result()
+                        if success:
+                            successful_segments += 1
+                            console.print(f"  [green]✓[/green]  Segment {i+1}/{total_segments}")
+                        else:
+                            console.print(
+                                f"  [yellow]⚠[/yellow]  Segment {i+1} failed. "
+                                f"Retrying (max {self.max_retries} times)..."
+                            )
+
+                            retries = 0
+                            recovered = False
+                            while retries < self.max_retries and not _tm.is_terminating():
+                                wait_time = min(2 ** retries, 10)  # Exponential backoff
+                                logger.info(f"Waiting {wait_time}s before retry {retries+1}/{self.max_retries}")
+                                time.sleep(wait_time)
+
+                                logger.info(f"Retrying segment {i+1}...")
+                                ok = self.segment_video(i, start, end)
+                                if ok:
+                                    successful_segments += 1
+                                    console.print(f"  [green]✓[/green]  Segment {i+1} succeeded on retry {retries+1}")
+                                    recovered = True
+                                    break
+                                retries += 1
+
+                            if not recovered and not _tm.is_terminating():
+                                failed_segments += 1
+                                console.print(f"  [red]✗[/red]  Segment {i+1} failed after {self.max_retries} retries")
+
+                    except Exception as e:
+                        logger.error(f"Exception in segmentation: {e}")
+                        console.print(f"  [red]✗[/red]  Segment {i+1} raised an exception: {e}")
                         failed_segments += 1
-                        i, start, end = futures[future]
-                        logger.warning(f"Segment {i+1} failed. Retrying (max {self.max_retries} times)...")
-                        
-                        retries = 0
-                        while retries < self.max_retries and not _tm.is_terminating():
-                            wait_time = min(2 ** retries, 10)  # Exponential backoff
-                            logger.info(f"Waiting {wait_time}s before retry {retries+1}/{self.max_retries}")
-                            time.sleep(wait_time)
-                            
-                            logger.info(f"Retrying segment {i+1}...")
-                            ok = self.segment_video(i, start, end)
-                            if ok:
-                                successful_segments += 1
-                                logger.info(f"Segment {i+1} succeeded on retry {retries+1}")
-                                break
-                            retries += 1
-                        
-                        if retries >= self.max_retries:
-                            logger.error(f"Segment {i+1} failed after {self.max_retries} retries. Skipping.")
-                    
-                    # Update progress with enhanced metrics
-                    processed_segments = successful_segments + failed_segments
-                    self.update_progress(processed_segments - 1, total_segments)
-                    
-                except Exception as e:
-                    logger.error(f"Exception in segmentation: {e}")
-                    failed_segments += 1
+
+                    progress.advance(task)
 
         if _tm.is_terminating():
+            console.print("\n[red]  Cancelled (Esc pressed).[/red]")
             logger.info("Segmentation terminated by user.")
         else:
-            self.progress_bar.n = 100
-            self.progress_bar.refresh()
             logger.info("Segmentation complete.")
 
-        self.progress_bar.close()
-        
-        # Enhanced final summary
+        # ── Summary ───────────────────────────────────────────────────────────
         elapsed = time.time() - self._start_time if self._start_time else 0.0
-        if elapsed > 0:
+        console.print()
+        console.print(Rule("Summary", style="cyan"))
+
+        table = Table(show_lines=False, header_style="bold cyan", min_width=50)
+        table.add_column("Metric", style="dim")
+        table.add_column("Value", style="bold white", justify="right")
+
+        table.add_row("Total segments", str(total_segments))
+        table.add_row("Successful", str(successful_segments))
+        table.add_row("Failed", str(failed_segments))
+        table.add_row("Total time", f"{elapsed:.2f}s")
+        if elapsed > 0 and successful_segments > 0:
             avg_rate = successful_segments / elapsed
-            logger.info(f"Total time: {elapsed:.2f}s")
-            logger.info(f"Successful segments: {successful_segments}/{total_segments}")
-            logger.info(f"Failed segments: {failed_segments}/{total_segments}")
-            logger.info(f"Average rate: {avg_rate:.2f} segments/sec")
+            table.add_row("Average rate", f"{avg_rate:.2f} segments/sec")
+
+        console.print(table)
 
 
 def main():

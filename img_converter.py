@@ -5,7 +5,6 @@ import time
 from typing import List, Tuple
 from pathlib import Path
 from PIL import Image, UnidentifiedImageError, ImageFile
-from tqdm import tqdm
 
 # ── ESC-key abort (via shared TerminationManager) ─────────────────────────────
 _scripts_dir = str(Path(__file__).parent / "src" / "scripts")
@@ -16,6 +15,34 @@ del _scripts_dir
 _tm = _TerminationManager()
 _tm.start_monitoring()
 
+# ── Dependency check ──────────────────────────────────────────────────────────
+
+def _importable(name: str) -> bool:
+    try: __import__(name); return True
+    except ImportError: return False
+
+def _check_deps() -> None:
+    missing = [pkg for pkg, mod in [("rich", "rich")] if not _importable(mod)]
+    if missing:
+        print(f"\n  ✗  Run:  pip install {' '.join(missing)}\n")
+        sys.exit(1)
+
+_check_deps()
+
+# ── Imports (after dep-check) ─────────────────────────────────────────────────
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Confirm
+from rich.rule import Rule
+from rich.table import Table
+from rich.progress import (
+    BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
+    TextColumn, TimeElapsedColumn, TimeRemainingColumn,
+)
+
+console = Console()
+
 # HEIC support
 try:
     from pillow_heif import register_heif_opener
@@ -23,7 +50,7 @@ try:
     _HAS_HEIC = True
 except ImportError:
     _HAS_HEIC = False
-    print("[WARN] pillow-heif not found. .heic support disabled.")
+    console.print("[yellow]  ⚠  pillow-heif not found. .heic support disabled.[/yellow]")
 
 # Safety: mitigate decompression bombs
 ImageFile.LOAD_TRUNCATED_IMAGES = False
@@ -188,7 +215,7 @@ def delete_source(file_path: str) -> Tuple[bool, str]:
 
 def convert_images(folder: str) -> None:
     if not os.path.isdir(folder):
-        print(f"[ERROR] The path '{folder}' is not a valid directory.")
+        console.print(f"[red]  ✗  The path '{folder}' is not a valid directory.[/red]")
         return
 
     all_files = list_files_recursive(folder)
@@ -196,88 +223,95 @@ def convert_images(folder: str) -> None:
     total = len(total_candidates)
 
     if total == 0:
-        print("[INFO] No convertible images found (.webp, .png, .jpeg" + (", .heic" if _HAS_HEIC else "") + ").")
+        exts = ".webp, .png, .jpeg" + (", .heic" if _HAS_HEIC else "")
+        console.print(f"[yellow]  ⚠  No convertible images found ({exts}).[/yellow]")
         return
 
-    # Pre-calculate metrics for better performance
     converted = 0
     deleted = 0
     failed = 0
     total_original_size = 0
     total_converted_size = 0
     start_time = time.time()
-    
-    # Optimized progress bar with consistent formatting
-    with tqdm(total=total, desc="Converting", unit="img", dynamic_ncols=True, mininterval=0.1,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
-                leave=True) as pbar:
-        
+
+    console.print()
+    console.print(Rule("Converting", style="cyan"))
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=28),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        refresh_per_second=6,
+    ) as progress:
+        task = progress.add_task("[cyan]Converting[/cyan]", total=total)
+
         for file_path in total_candidates:
             if _tm.is_terminating():
-                print("\n[INFO] Conversion cancelled by user.")
+                console.print("\n[red]  Cancelled (Esc pressed).[/red]")
                 break
-            
-            file_start_time = time.time()
+
+            fname = os.path.basename(file_path)
+            progress.update(task, description=f"[white]{fname[:40]}[/white]")
+
             original_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
             total_original_size += original_size
-            
+
             ok, err = convert_one(file_path)
-            
+
             if ok:
                 converted_size = os.path.getsize(target_jpg_path(file_path)) if os.path.exists(target_jpg_path(file_path)) else 0
                 total_converted_size += converted_size
-                
+
                 # Only delete original if conversion succeeded
                 del_ok, _ = delete_source(file_path)
                 converted += 1
                 if del_ok:
                     deleted += 1
-                
-                # Calculate compression ratio for this file
-                compression_ratio = (1 - converted_size / original_size) * 100 if original_size > 0 else 0
-                ratio_str = f"{compression_ratio:.1f}%"
+
+                ratio = (1 - converted_size / original_size) * 100 if original_size > 0 else 0
+                console.print(
+                    f"  [green]✓[/green]  {fname[:45]}  "
+                    f"{format_size(original_size)} → {format_size(converted_size)}  "
+                    f"[green]−{ratio:.1f}%[/green]"
+                )
             else:
                 failed += 1
-                ratio_str = "N/A"
-                converted_size = 0
+                console.print(f"  [red]✗[/red]  {fname[:45]}  {err}")
 
-            # Calculate processing rate and time estimates
-            elapsed = time.time() - start_time
-            processed = converted + failed
-            rate = processed / elapsed if elapsed > 0 else 0
-            
-            # Optimized postfix with essential metrics
-            postfix_dict = {'✓': converted, '✗': failed, '🗑': deleted}
-            
-            if converted > 0 and total_original_size > 0:
-                overall_ratio = (1 - total_converted_size / total_original_size) * 100
-                postfix_dict['saved'] = f"{overall_ratio:.1f}%"
-            
-            pbar.set_postfix(postfix_dict, refresh=False)
-            pbar.update(1)
+            progress.advance(task)
 
-    # Enhanced final summary
+    # ── Summary ───────────────────────────────────────────────────────────────
     elapsed_time = time.time() - start_time
-    print("\n" + "="*60)
-    print("📊 CONVERSION SUMMARY")
-    print("="*60)
-    print(f"📁 Total files processed:     {total}")
-    print(f"✅ Successfully converted:     {converted}")
-    print(f"🗑️  Original files deleted:    {deleted}")
-    print(f"❌ Failed conversions:        {failed}")
-    print(f"⏱️  Total processing time:     {elapsed_time:.1f}s")
-    
+    console.print()
+    console.print(Rule("Conversion Summary", style="cyan"))
+
+    table = Table(show_lines=False, header_style="bold cyan", min_width=50)
+    table.add_column("Metric", style="dim")
+    table.add_column("Value", style="bold white", justify="right")
+
+    table.add_row("Total files processed", str(total))
+    table.add_row("Successfully converted", str(converted))
+    table.add_row("Original files deleted", str(deleted))
+    table.add_row("Failed conversions", str(failed))
+    table.add_row("Total processing time", f"{elapsed_time:.1f}s")
+
     if total_original_size > 0:
-        print(f"💾 Original total size:        {format_size(total_original_size)}")
-        print(f"📦 Converted total size:       {format_size(total_converted_size)}")
+        table.add_row("Original total size", format_size(total_original_size))
+        table.add_row("Converted total size", format_size(total_converted_size))
         space_saved = total_original_size - total_converted_size
-        print(f"💰 Space saved:               {format_size(space_saved)} ({(1 - total_converted_size/total_original_size)*100:.1f}%)")
-        
+        table.add_row(
+            "Space saved",
+            f"{format_size(space_saved)} ({(1 - total_converted_size/total_original_size)*100:.1f}%)",
+        )
         if converted > 0:
             avg_rate = converted / elapsed_time if elapsed_time > 0 else 0
-            print(f"⚡ Average processing rate:   {avg_rate:.1f} files/sec")
-    
-    print("="*60)
+            table.add_row("Average processing rate", f"{avg_rate:.1f} files/sec")
+
+    console.print(table)
 
 def _jpg_paths(folder: str) -> List[str]:
     return [f for f in list_files_recursive(folder) if f.lower().endswith('.jpg')]
@@ -336,32 +370,47 @@ def compress_jpgs(folder: str) -> None:
     jpgs = _jpg_paths(folder)
     total = len(jpgs)
     if total == 0:
-        print("[INFO] No .jpg files found to compress.")
+        console.print("[yellow]  ⚠  No .jpg files found to compress.[/yellow]")
         return
-        
+
     compressed = 0
     deleted = 0
     skipped = 0
     failed = 0
     aborted = False
-    
+
     total_original_size = sum(os.path.getsize(f) for f in jpgs if os.path.exists(f))
     total_compressed_size = 0
     total_saved = 0
     start_time = time.time()
-    
+
+    console.print()
+    console.print(Rule("Compressing", style="cyan"))
+
     try:
-        with tqdm(total=total, desc="Compressing", unit="img", dynamic_ncols=True, mininterval=0.1,
-                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
-                    leave=True) as pbar:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=28),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=6,
+        ) as progress:
+            task = progress.add_task("[cyan]Compressing[/cyan]", total=total)
+
             for file_path in jpgs:
                 if _tm.is_terminating():
                     aborted = True
                     break
-                
+
+                fname = os.path.basename(file_path)
+                progress.update(task, description=f"[white]{fname[:40]}[/white]")
+
                 original_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
                 ok, err, replaced = compress_one_jpg(file_path)
-                
+
                 if ok:
                     if replaced:
                         compressed += 1
@@ -370,69 +419,76 @@ def compress_jpgs(folder: str) -> None:
                         saved = original_size - new_size
                         total_saved += saved
                         total_compressed_size += new_size
+                        ratio = (saved / original_size) * 100 if original_size > 0 else 0
+                        console.print(
+                            f"  [green]🗜[/green]  {fname[:45]}  "
+                            f"{format_size(original_size)} → {format_size(new_size)}  "
+                            f"[green]−{ratio:.1f}%[/green]"
+                        )
                     else:
                         skipped += 1
                         total_compressed_size += original_size
+                        console.print(f"  [yellow]⏭[/yellow]  {fname[:45]}  no reduction")
                 else:
                     failed += 1
                     total_compressed_size += original_size
-                
-                # Calculate processing metrics
-                elapsed = time.time() - start_time
-                processed = compressed + skipped + failed
-                rate = processed / elapsed if elapsed > 0 else 0
-                
-                # Optimized postfix with compression metrics
-                postfix_dict = {'🗜': compressed, '⏭': skipped, '✗': failed}
-                
-                if total_saved > 0 and total_original_size > 0:
-                    avg_compression = (total_saved / total_original_size) * 100
-                    postfix_dict['saved'] = f"{avg_compression:.1f}%"
-                
-                pbar.set_postfix(postfix_dict, refresh=False)
-                pbar.update(1)
+                    console.print(f"  [red]✗[/red]  {fname[:45]}  {err}")
+
+                progress.advance(task)
     except KeyboardInterrupt:
         aborted = True
-    
-    # Enhanced compression summary
+
+    # ── Summary ───────────────────────────────────────────────────────────────
     elapsed_time = time.time() - start_time
     if aborted:
-        print("\n[INFO] Compression cancelled by user.")
-    
-    print("\n" + "="*60)
-    print("📊 COMPRESSION SUMMARY")
-    print("="*60)
-    print(f"📁 Total .jpg files processed:  {total}")
-    print(f"🗜️  Successfully compressed:      {compressed}")
-    print(f"⏭️  Skipped (no reduction):      {skipped}")
-    print(f"❌ Failed compressions:         {failed}")
-    print(f"⏱️  Total processing time:        {elapsed_time:.1f}s")
-    
+        console.print("\n[red]  Cancelled (Esc pressed).[/red]")
+
+    console.print()
+    console.print(Rule("Compression Summary", style="cyan"))
+
+    table = Table(show_lines=False, header_style="bold cyan", min_width=50)
+    table.add_column("Metric", style="dim")
+    table.add_column("Value", style="bold white", justify="right")
+
+    table.add_row("Total .jpg files processed", str(total))
+    table.add_row("Successfully compressed", str(compressed))
+    table.add_row("Skipped (no reduction)", str(skipped))
+    table.add_row("Failed compressions", str(failed))
+    table.add_row("Total processing time", f"{elapsed_time:.1f}s")
+
     if total_original_size > 0:
-        print(f"💾 Original total size:          {format_size(total_original_size)}")
-        print(f"📦 Final total size:             {format_size(total_compressed_size)}")
-        print(f"💰 Total space saved:            {format_size(total_saved)} ({(total_saved/total_original_size)*100:.1f}%)")
-        
+        table.add_row("Original total size", format_size(total_original_size))
+        table.add_row("Final total size", format_size(total_compressed_size))
+        table.add_row(
+            "Total space saved",
+            f"{format_size(total_saved)} ({(total_saved/total_original_size)*100:.1f}%)",
+        )
         if compressed > 0:
             avg_rate = compressed / elapsed_time if elapsed_time > 0 else 0
-            print(f"⚡ Average compression rate:    {avg_rate:.1f} files/sec")
-    
-    print("="*60)
+            table.add_row("Average compression rate", f"{avg_rate:.1f} files/sec")
+
+    console.print(table)
 
 if __name__ == "__main__":
+    console.print(Panel.fit(
+        "[bold cyan]Image Converter[/bold cyan]\n"
+        "[dim]Converts .webp / .png / .jpeg" + (" / .heic" if _HAS_HEIC else "") + " to .jpg, deletes originals on success[/dim]",
+        border_style="cyan",
+    ))
+
     # Accept folder path from command line or prompt
     if len(sys.argv) > 1:
         folder_path = sys.argv[1]
     else:
-        folder_path = input("Enter folder path to convert images: ").strip()
+        folder_path = console.input("[cyan]Enter folder path to convert images:[/cyan] ").strip()
     convert_images(folder_path)
     try:
-        resp = input("Would you like to run the compression process? (yes/no) ").strip().lower()
+        run_compress = Confirm.ask("\nWould you like to run the compression process?", default=False)
     except KeyboardInterrupt:
-        print("\n[INFO] Compression process prompt cancelled by user.")
+        console.print("\n[yellow]  ⚠  Compression process prompt cancelled by user.[/yellow]")
         sys.exit(0)
-    if resp in ("y", "yes"):
+    if run_compress:
         compress_jpgs(folder_path)
     else:
-        print("[INFO] Compression skipped.")
+        console.print("[dim]Compression skipped.[/dim]")
 

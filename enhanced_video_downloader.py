@@ -41,17 +41,41 @@ del _scripts_dir
 _tm = _TerminationManager()
 _tm.start_monitoring()
 
-try:
-    import requests
-    from bs4 import BeautifulSoup
-    import yt_dlp
-    from tqdm import tqdm
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-except ImportError as e:
-    print(f"Missing required dependency: {e}")
-    print("Please install required packages: pip install requests beautifulsoup4 yt-dlp tqdm")
-    sys.exit(1)
+# ── Dependency check ──────────────────────────────────────────────────────────
+
+def _importable(name: str) -> bool:
+    try: __import__(name); return True
+    except ImportError: return False
+
+def _check_deps() -> None:
+    missing = [pkg for pkg, mod in [
+        ("rich", "rich"), ("requests", "requests"),
+        ("beautifulsoup4", "bs4"), ("yt-dlp", "yt_dlp"),
+    ] if not _importable(mod)]
+    if missing:
+        print(f"\n  ✗  Run:  pip install {' '.join(missing)}\n")
+        sys.exit(1)
+
+_check_deps()
+
+# ── Imports (after dep-check) ─────────────────────────────────────────────────
+
+import requests
+from bs4 import BeautifulSoup
+import yt_dlp
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+from rich.progress import (
+    BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
+    TextColumn, TimeElapsedColumn, TimeRemainingColumn,
+)
+
+console = Console()
 
 
 class EnhancedVideoDownloader:
@@ -134,14 +158,13 @@ class EnhancedVideoDownloader:
         
     def setup_logging(self):
         """Setup logging configuration."""
+        # File only — a rich Progress live display owns stdout while
+        # downloads run; a stdout StreamHandler would tear the bar apart.
         log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         logging.basicConfig(
             level=logging.INFO,
             format=log_format,
-            handlers=[
-                logging.FileHandler('enhanced_video_downloader.log', encoding='utf-8'),
-                logging.StreamHandler(sys.stdout)
-            ]
+            handlers=[logging.FileHandler('enhanced_video_downloader.log', encoding='utf-8')]
         )
         # Set verbose flag
         self.verbose = False
@@ -550,47 +573,44 @@ class EnhancedVideoDownloader:
         # Android-specific optimizations
         timeout = 60 if self.android_mode else 30  # Longer timeout for mobile networks
         chunk_size = 4096 if self.android_mode else 8192  # Smaller chunks for mobile
-        
+
         response = self.session.get(url, stream=True, timeout=timeout)
         response.raise_for_status()
-        
+
         total_size = int(response.headers.get('content-length', 0))
-        
-        with open(output_path, 'wb') as f:
-            if total_size > 0:
-                desc = output_path.name[:30] + '...' if len(output_path.name) > 30 else output_path.name
-                with tqdm(total=total_size, unit='B', unit_scale=True, desc=desc,
-                         disable=self.android_mode and not sys.stdout.isatty()) as pbar:
-                    downloaded = 0
+        fname = output_path.name[:40] + '...' if len(output_path.name) > 40 else output_path.name
+
+        # On Android without a real terminal, skip the live bar entirely
+        # rather than spamming disconnected progress lines.
+        show_progress = not (self.android_mode and not console.is_terminal)
+
+        if show_progress:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(bar_width=28),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+                refresh_per_second=6,
+            ) as progress:
+                task = progress.add_task(f"[white]{fname}[/white]", total=total_size or None)
+                with open(output_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=chunk_size):
                         if _tm.is_terminating():
                             return False
                         if chunk:
                             f.write(chunk)
-                            downloaded += len(chunk)
-                            pbar.update(len(chunk))
-                            
-                            # Mobile-friendly progress updates
-                            if self.android_mode and downloaded % (chunk_size * 100) == 0:
-                                progress = (downloaded / total_size) * 100
-                                print(f"\rProgress: {progress:.1f}%", end='', flush=True)
-            else:
-                # No content-length header
-                downloaded = 0
+                            progress.advance(task, len(chunk))
+        else:
+            with open(output_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if _tm.is_terminating():
                         return False
                     if chunk:
                         f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        # Show progress for unknown size downloads on mobile
-                        if self.android_mode and downloaded % (chunk_size * 50) == 0:
-                            print(f"\rDownloaded: {downloaded / 1024 / 1024:.1f} MB", end='', flush=True)
-                            
-        if self.android_mode:
-            print()  # New line after progress
-            
+
         return True
         
     def _download_with_ytdlp(self, url: str, output_path: Path) -> bool:
@@ -952,62 +972,77 @@ class EnhancedVideoDownloader:
     def run_gui(self):
         """Run the GUI application."""
         if self.android_mode and tk is None:
-            print("❌ GUI mode not available on Android. Using CLI mode instead.")
+            console.print("[red]  ✗  GUI mode not available on Android. Using CLI mode instead.[/red]")
             return False
-            
+
         gui_created = self.create_gui()
         if gui_created is False:
-            print("❌ Failed to create GUI. Falling back to CLI mode.")
+            console.print("[red]  ✗  Failed to create GUI. Falling back to CLI mode.[/red]")
             return False
-            
+
         if self.root:
             self.root.mainloop()
             return True
         return False
-        
+
     def run_cli(self, url: str):
         """Run in command-line mode."""
-        print(f"🔍 Analyzing URL: {url}")
-        
+        console.print()
+        console.print(Rule("Analyzing", style="cyan"))
+        console.print(f"[dim]URL:[/dim] {url}")
+
         videos = self.extract_videos_enhanced(url)
-        
+
         if not videos:
-            print("❌ No videos found")
+            console.print("[red]  ✗  No videos found[/red]")
             return False
-            
-        print(f"✅ Found {len(videos)} videos:")
+
+        table = Table(show_lines=False, header_style="bold cyan", min_width=50)
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Title", style="white")
+        table.add_column("Format", style="dim")
+        table.add_column("Quality", style="dim")
         for i, video in enumerate(videos, 1):
-            title = video.get('title', 'Unknown')
-            format_info = video.get('format', 'unknown')
-            quality = video.get('quality', 'unknown')
-            print(f"  {i}. {title} [{format_info}] ({quality})")
-            
-        print("\n📥 Starting downloads...")
-        print("Press Escape key to terminate gracefully\n")
-        
+            table.add_row(
+                str(i),
+                video.get('title', 'Unknown'),
+                video.get('format', 'unknown'),
+                video.get('quality', 'unknown'),
+            )
+        console.print(table)
+
+        console.print()
+        console.print(Rule("Downloading", style="cyan"))
+        console.print("[dim]Press Escape key to terminate gracefully[/dim]\n")
+
         for i, video in enumerate(videos, 1):
             if _tm.is_terminating():
                 break
-                
+
             title = video.get('title', 'video')
             format_ext = video.get('format', 'mp4')
             safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
             filename = f"{safe_title}.{format_ext}"
             output_path = self.output_dir / filename
-            
-            print(f"📥 Downloading ({i}/{len(videos)}): {title}")
-            
+
+            console.print(f"[cyan]({i}/{len(videos)})[/cyan] {title}")
+
             success = self.download_video_enhanced(video, output_path)
-            
+
             if success:
-                print(f"✅ Downloaded: {filename}")
+                console.print(f"  [green]✓[/green]  Downloaded: {filename}")
             else:
-                print(f"❌ Failed: {title}")
-                
-        print(f"\n🎉 Download completed!")
-        print(f"✅ Successful: {self.successful_downloads}")
-        print(f"❌ Failed: {self.failed_downloads}")
-        
+                console.print(f"  [red]✗[/red]  Failed: {title}")
+
+        console.print()
+        console.print(Rule("Summary", style="cyan"))
+        summary = Table(show_lines=False, header_style="bold cyan", min_width=40)
+        summary.add_column("Metric", style="dim")
+        summary.add_column("Value", style="bold white", justify="right")
+        summary.add_row("Successful", str(self.successful_downloads))
+        summary.add_row("Failed", str(self.failed_downloads))
+        console.print(summary)
+
         return self.successful_downloads > 0
 
 
@@ -1078,105 +1113,115 @@ Examples:
     try:
         if args.gui or (not args.url and not args.batch):
             # GUI mode
-            if ANDROID_MODE:
-                print("📱 Android detected - attempting GUI mode...")
-            else:
-                print("🚀 Starting Enhanced Video Downloader GUI...")
-                
+            subtitle = ("[dim]Android detected - attempting GUI mode...[/dim]" if ANDROID_MODE
+                        else "[dim]Starting GUI...[/dim]")
+            console.print(Panel.fit(
+                f"[bold cyan]Enhanced Video Downloader[/bold cyan]\n{subtitle}",
+                border_style="cyan",
+            ))
+
             gui_success = downloader.run_gui()
             if not gui_success and ANDROID_MODE:
-                print("📱 GUI not available on Android. Please provide a URL for CLI mode.")
-                print("Usage: python script.py <URL>")
+                console.print("[yellow]  ⚠  GUI not available on Android. Please provide a URL for CLI mode.[/yellow]")
+                console.print("[dim]Usage: python script.py <URL>[/dim]")
                 sys.exit(1)
         elif args.batch:
             # Batch CLI mode
             try:
                 with open(args.batch, 'r', encoding='utf-8') as f:
                     urls = [url.strip() for url in f.readlines() if url.strip()]
-                    
+
                 if not urls:
-                    print("❌ No valid URLs found in batch file")
+                    console.print("[red]  ✗  No valid URLs found in batch file[/red]")
                     sys.exit(1)
-                    
-                print(f"🔍 Processing {len(urls)} URLs from batch file...")
-                
+
+                console.print()
+                console.print(Rule("Analyzing", style="cyan"))
+                console.print(f"[dim]Processing {len(urls)} URLs from batch file...[/dim]")
+
                 all_videos = []
                 for i, url in enumerate(urls, 1):
                     if _tm.is_terminating():
                         break
-                        
-                    print(f"\n📋 Analyzing URL ({i}/{len(urls)}): {url}")
-                    
+
+                    console.print(f"[cyan]({i}/{len(urls)})[/cyan] {url}")
+
                     try:
                         videos = downloader.extract_videos_enhanced(url)
-                        
+
                         if videos:
                             # Add source info
                             for video in videos:
                                 video['source_url'] = url
                                 video['source_index'] = i
                             all_videos.extend(videos)
-                            print(f"✅ Found {len(videos)} video(s)")
+                            console.print(f"  [green]✓[/green]  Found {len(videos)} video(s)")
                         else:
-                            print("❌ No videos found")
-                            
+                            console.print("  [red]✗[/red]  No videos found")
+
                     except Exception as e:
-                        print(f"❌ Error analyzing {url}: {e}")
-                        
+                        console.print(f"  [red]✗[/red]  Error analyzing {url}: {e}")
+
                 if not all_videos:
-                    print("\n❌ No videos found from any URLs")
+                    console.print("\n[red]  ✗  No videos found from any URLs[/red]")
                     sys.exit(1)
-                    
-                print(f"\n📥 Starting downloads for {len(all_videos)} videos...")
-                print("Press Escape key to terminate gracefully\n")
-                
+
+                console.print()
+                console.print(Rule("Downloading", style="cyan"))
+                console.print(f"[dim]{len(all_videos)} video(s) queued. Press Escape key to terminate gracefully.[/dim]\n")
+
                 for i, video in enumerate(all_videos, 1):
                     if _tm.is_terminating():
                         break
-                        
+
                     title = video.get('title', 'video')
                     format_ext = video.get('format', 'mp4')
                     safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
                     filename = f"{safe_title}.{format_ext}"
                     output_path = downloader.output_dir / filename
-                    
-                    source_info = f" [Source {video.get('source_index', '?')}]"
-                    print(f"📥 Downloading ({i}/{len(all_videos)}): {title}{source_info}")
-                    
+
+                    source_info = f" [dim][Source {video.get('source_index', '?')}][/dim]"
+                    console.print(f"[cyan]({i}/{len(all_videos)})[/cyan] {title}{source_info}")
+
                     success = downloader.download_video_enhanced(video, output_path)
-                    
+
                     if success:
-                        print(f"✅ Downloaded: {filename}")
+                        console.print(f"  [green]✓[/green]  Downloaded: {filename}")
                     else:
-                        print(f"❌ Failed: {title}")
-                        
-                print(f"\n🎉 Batch download completed!")
-                print(f"✅ Successful: {downloader.successful_downloads}")
-                print(f"❌ Failed: {downloader.failed_downloads}")
-                
+                        console.print(f"  [red]✗[/red]  Failed: {title}")
+
+                console.print()
+                console.print(Rule("Summary", style="cyan"))
+                summary = Table(show_lines=False, header_style="bold cyan", min_width=40)
+                summary.add_column("Metric", style="dim")
+                summary.add_column("Value", style="bold white", justify="right")
+                summary.add_row("Successful", str(downloader.successful_downloads))
+                summary.add_row("Failed", str(downloader.failed_downloads))
+                console.print(summary)
+
             except FileNotFoundError:
-                print(f"❌ Batch file not found: {args.batch}")
+                console.print(f"[red]  ✗  Batch file not found: {args.batch}[/red]")
                 sys.exit(1)
             except Exception as e:
-                print(f"❌ Error processing batch file: {e}")
+                console.print(f"[red]  ✗  Error processing batch file: {e}[/red]")
                 sys.exit(1)
         else:
             # Single URL CLI mode
             success = downloader.run_cli(args.url)
-            
+
             if _tm.is_terminating():
-                print("\n⏹️  Video download process was terminated by user")
+                console.print("\n[red]  Cancelled (Esc pressed).[/red]")
                 sys.exit(0)
             elif not success:
                 sys.exit(1)
-                
+
     except KeyboardInterrupt:
-        print("\n\n⏹️  Process interrupted by user")
+        console.print("\n\n[yellow]  ⚠  Process interrupted by user[/yellow]")
         if hasattr(downloader, 'successful_downloads') and downloader.successful_downloads > 0:
-            print(f"✅ {downloader.successful_downloads} video(s) were successfully downloaded before interruption")
+            console.print(f"[green]  ✓  {downloader.successful_downloads} video(s) were successfully downloaded before interruption[/green]")
         sys.exit(0)
     except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
+        console.print(f"\n[red]  ✗  Unexpected error: {e}[/red]")
         sys.exit(1)
 
 
